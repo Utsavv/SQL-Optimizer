@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets / environment
+.env
+.env.*
+*.env
+connection_string.txt
+odbc*.ini
+
+# Generated outputs
+report.md
+*.log
+*.bak
+
+# Azure / cloud
+*.publishsettings
+local.settings.json
