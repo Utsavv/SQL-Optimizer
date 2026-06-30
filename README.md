@@ -1,68 +1,132 @@
 # sp-optimizer
 
-AI-driven, iterative optimizer for SQL Server stored procedures.
+An AI **skill** that iteratively optimizes SQL Server stored procedures by
+running a closed feedback loop: discover the parameter space → capture
+execution plans across it → analyze them deterministically → let an LLM propose
+one smallest-safe change → apply it to a **sandbox copy** → re-verify → repeat
+until the *majority* of parameter calls land on a good plan.
 
-It treats tuning as a closed feedback loop: discover the parameter space →
-capture execution plans across that space → analyze plans deterministically →
-let an LLM propose one smallest-safe change → apply to a **sandbox copy** →
-re-verify → repeat until the *majority* of parameter calls land on a good plan.
-
-This directly targets parameter sniffing, where a proc compiled for one set of
+It directly targets **parameter sniffing**, where a proc compiled for one set of
 arguments performs badly for others.
 
-## Why this is different from existing tools
+## What this is
 
-Existing tools (PerformanceStudio, PerformanceMonitor, SQL MCP Server) do
-one-shot plan analysis or monitoring. None of them run an autonomous
-**discover → change → re-verify** loop scored across the whole parameter
-workload. That loop is the contribution here.
+This is a [Claude Code skill](https://code.claude.com/docs) (`SKILL.md`),
+not just a script. You drive it in plain language and it orchestrates the loop
+for you, calling the Python modules in this repo at each step. The Python is the
+**engine**; the skill is the **driver** that decides when to discover, capture,
+analyze, change, and re-verify.
+
+## Using the skill
+
+Point your agent at the repo and ask it, in plain language, to tune a procedure:
+
+> "Optimize `dbo.usp_GetMemberActivity` in my Loyalty database — it's slow for
+> some date ranges."
+
+The skill takes over from there. It will:
+
+1. **Discover** the proc's parameters and derive a representative workload
+   **from the proc's own data** (no hand-written test cases).
+2. **Capture** an execution plan for each parameter combination.
+3. **Analyze** those plans deterministically — scans, spills, sniffing skew,
+   missing indexes.
+4. **Decide** on a single smallest-safe change (hint, `OPTION`, index, rewrite)
+   via the LLM, or stop if the proc is already good enough.
+5. **Apply** the change to a **sandbox copy** (`<proc>_opt_v<n>`) — never the
+   live object.
+6. **Verify** by re-capturing plans across the *same* workload, and repeat until
+   the majority improve without regressions.
+
+The skill is **procedure-agnostic**: just name a different proc. The workload is
+derived from each proc's real column ranges, so there's no per-proc setup. See
+`SKILL.md` for the full operating procedure, termination conditions, and the
+non-negotiable safety rules.
+
+### Talking to the skill
+
+You don't need flags to use the skill — describe the goal and let it run. The
+common levers it exposes:
+
+- **Which proc** — any schema-qualified name (`dbo.usp_GetMemberActivity`).
+- **How aggressive** — a target fraction of combos that must reach a good plan
+  (default 80%) and a max iteration count (default 5).
+- **Estimated vs actual** — estimated plans are read-only and the default; ask
+  for *actual* runtime stats only against non-prod, since that executes the proc.
+- **Which LLM backend** — Claude, Gemini (Vertex AI), or a replay/file backend.
+
+## How the Python code powers the skill
+
+The skill orchestrates; these Python modules do the deterministic work. The LLM
+is only consulted at the single decision step — everything else is testable
+offline.
+
+| Module | Step it serves | Role | LLM? |
+|---|---|---|---|
+| `scripts/discover.py` | Discover | parameter space → workload combos, **auto-derived from the proc's real data** (`derive_combos_from_data`) | no |
+| `scripts/capture.py` | Capture | execution plan + runtime capture | no |
+| `scripts/analyze.py` | Analyze | deterministic plan-XML scoring | no |
+| `scripts/llm.py` | Decide | propose one safe change as strict JSON; pluggable Claude / Gemini / file backend | **yes** |
+| `scripts/optimize.py` | Apply + Verify | the loop + sandbox management + CLI + report | no |
+
+The skill walks these in order — discover → capture → analyze → decide →
+apply → verify — and loops until a termination condition in `SKILL.md` is met.
+
+### Running the engine directly
+
+The skill normally invokes this for you, but the same pipeline runs as a CLI when
+you want to drive it by hand or in CI:
+
+```bash
+python -m scripts.optimize \
+  --proc "dbo.usp_GetMemberActivity" \
+  --conn "Driver={ODBC Driver 18 for SQL Server};Server=.;Database=Loyalty;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes" \
+  --backend claude \
+  --max-iterations 5 --target-fraction 0.8 \
+  --report out/report.md
+# --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
+# Add --actual to capture runtime stats (executes the proc — non-prod only).
+```
 
 ## Install
 
 ```bash
 pip install pyodbc
 # choose one backend:
-pip install google-cloud-aiplatform vertexai   # Gemini (Vertex AI)
 pip install anthropic                           # Claude
+pip install google-cloud-aiplatform vertexai    # Gemini (Vertex AI)
 ```
 
-Requires ODBC Driver 18 for SQL Server.
+Requires ODBC Driver 18 for SQL Server. Works against on-prem SQL Server
+(2016+), Azure SQL MI, and AWS RDS for SQL Server.
 
-## Run
+## Why this is different from existing tools
 
-```bash
-python -m scripts.optimize \
-  --proc "dbo.usp_GetMemberActivity" \
-  --conn "Driver={ODBC Driver 18 for SQL Server};Server=.;Database=Loyalty;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes" \
-  --backend gemini --project my-gcp-project \
-  --max-iterations 5 --target-fraction 0.8 \
-  --report out/report.md
-```
-
-Add `--actual` to capture runtime stats (executes the proc — **non-prod only**).
-
-Works against **any** stored procedure — just change `--proc`. The workload is
-derived from the target proc's own column ranges, so no per-proc setup is
-needed. `examples/worldwideimporters/` is one fully worked run for reference.
-
-## Architecture
-
-| Module | Role | LLM? |
-|---|---|---|
-| `discover.py` | parameter space → workload combos, **auto-derived from the proc's real data** | no |
-| `capture.py` | execution plan + runtime capture | no |
-| `analyze.py` | deterministic plan scoring | no |
-| `llm.py` | propose one safe change as JSON | **yes** |
-| `optimize.py` | the loop + sandbox + CLI + report | no |
-
-The model is only used at the decision step. Everything else is deterministic
-and testable offline.
+Existing tools (PerformanceStudio, PerformanceMonitor, SQL MCP Server) do
+one-shot plan analysis or monitoring. None of them run an autonomous
+**discover → change → re-verify** loop scored across the whole parameter
+workload. That loop — driven by the skill — is the contribution here.
 
 ## Safety
 
 - The live procedure is **never** modified — changes go to `<proc>_opt_v<n>`.
-- Estimated plans are read-only; actual execution is opt-in.
+- Estimated plans are read-only; actual execution is opt-in (non-prod only).
 - Every change carries a rollback; all changes are written to `changes.sql`.
+- Indexes are never auto-created on production without surfacing cost/space
+  impact and getting confirmation.
+
+## Output
+
+A run produces, under the run's output dir:
+
+- A Markdown/HTML report: per-iteration workload scores, the change applied, and
+  a before/after comparison.
+- A `changes.sql` with every applied change and its rollback.
+- A `winner.sql` containing the best-performing procedure variant.
+
+`examples/worldwideimporters/` holds one fully worked run for reference
+(a covering index + `OPTION (RECOMPILE)`). It's illustrative only — not required
+to run the skill against your own proc.
 
 ## Status
 
@@ -72,3 +136,5 @@ that makes the skill generic across procedures. The DB-facing steps need a live
 SQL Server to exercise. Mining concrete argument values from Query Store and
 mapping more predicate shapes (multi-column, function-wrapped) are the next
 enhancements.
+</content>
+</invoke>
