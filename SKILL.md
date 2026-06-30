@@ -11,6 +11,8 @@ An AI-driven, iterative optimizer for SQL Server stored procedures. It treats op
 
 Trigger this whenever the user wants to make a stored procedure faster, mentions parameter sniffing, asks to analyze execution plans, or wants an autonomous loop that tunes a procedure. Works against on-prem SQL Server (2016+), Azure SQL MI, and AWS RDS for SQL Server.
 
+This skill is **procedure-agnostic** — point it at *any* stored procedure in any database with `--proc`. It reads the proc's signature, derives a representative workload from that proc's own data, and tunes it. Nothing is hard-wired to a particular schema or proc; the WorldWideImporters files under `examples/` are just one worked run, not a dependency.
+
 ## The core loop
 
 ```
@@ -47,32 +49,41 @@ Stop the loop when ANY of these is true:
 3. **Always produce a diff and a rollback script** for any change before applying it.
 4. **Never auto-create indexes on production** without surfacing the cost/space impact and getting confirmation.
 
-## How to run
+## Operating procedure for any stored procedure
 
-The skill is a Python package under `scripts/`. The typical entry point:
+The same flow applies to every proc — substitute the name and connection; nothing else is proc-specific.
+
+1. **Name the target.** Any schema-qualified proc: `--proc "<schema>.<proc>"`. No allow-list, no per-proc setup.
+2. **Connect.** Pass `--conn` or set `SQL_CONNECTION_STRING` in `.env`; the CLI reads it automatically.
+3. **Let the workload be derived.** `discover.py` reads the signature from `sys.parameters`, then builds the workload **from the proc's own data**: it maps each parameter to the column it filters, reads that column's real min/max, and fans out narrow → medium → wide → empty windows (the spread that exposes parameter-sniffing skew). No hand-written combos are needed for the common date-range case. You can still override with a curated `SP_OPT_COMBOS` file when you want exact values.
+4. **Run the loop.** Capture → analyze → decide → apply-to-sandbox → re-verify, until a termination condition is met.
+5. **Review outputs** under the run's output dir: the report, the applied changes + rollbacks, and the winning variant.
+
+### Typical entry point
 
 ```bash
 python -m scripts.optimize \
-  --proc "dbo.usp_GetMemberActivity" \
-  --conn "Driver={ODBC Driver 18 for SQL Server};Server=...;Database=Loyalty;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes" \
+  --proc "<schema>.<your_proc>" \
+  --backend claude \
   --max-iterations 5 \
   --target-fraction 0.8 \
-  --sandbox \
-  --report out/report.html
+  --report out/report.md
+# --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
+# add --actual to capture runtime stats (executes the proc — non-prod only).
 ```
 
 Walk through the modules in this order when reading or extending the code:
-1. `scripts/discover.py` — parameter discovery (see `references/parameter-discovery.md`)
+1. `scripts/discover.py` — parameter discovery + data-derived workload (see `references/parameter-discovery.md`)
 2. `scripts/capture.py` — execution plan + runtime capture
 3. `scripts/analyze.py` — plan XML scoring (see `references/plan-analysis.md`)
 4. `scripts/optimize.py` — the orchestration loop + LLM decision step
-5. `scripts/llm.py` — pluggable LLM backend (Gemini via Vertex AI, or Claude)
+5. `scripts/llm.py` — pluggable LLM backend (Gemini, Claude, or replay)
 
 ## LLM backend
 
-The decision step (step 4) is the only place an LLM is required. It is pluggable: `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with two implementations — `GeminiBackend` (Vertex AI, matches the user's existing stack) and `ClaudeBackend`. The analysis and capture steps are deterministic and need no model.
+The decision step (step 4) is the only place an LLM is required. It is pluggable: `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with three implementations — `GeminiBackend` (Vertex AI), `ClaudeBackend`, and `FileBackend` (`--backend file --decisions <path>`), which replays agent-made decisions from JSON when no model API key is available. The analysis and capture steps are deterministic and need no model.
 
-See `references/prompt-templates.md` for the structured JSON prompt that drives the decision step — it asks for a single, smallest-safe change plus rationale and a rollback, returned as strict JSON.
+The structured JSON prompt that drives the decision step lives in `scripts/llm.py` (`SYSTEM_PROMPT`) — it asks for a single, smallest-safe change plus rationale and a rollback, returned as strict JSON. None of it references any specific procedure, so it applies unchanged to whatever proc you target.
 
 ## Output
 
@@ -81,7 +92,11 @@ A run produces:
 - A `changes.sql` file with every applied change and its rollback.
 - A `winner.sql` containing the best-performing procedure variant.
 
+## Examples
+
+`examples/worldwideimporters/` holds one fully worked run (a covering index + `OPTION (RECOMPILE)` on `Integration.GetMovementUpdates`). It is illustrative only — useful to see the shape of `combos.json`, `decisions.json`, and `winner.sql` — and is **not** required to run the skill against your own proc.
+
 ## Extending
 
 - New plan-analysis rules go in `scripts/analyze.py` and are documented in `references/plan-analysis.md`.
-- To add a parameter-value strategy (e.g. pull real distributions from Query Store or a stats histogram), extend `scripts/discover.py`.
+- To add a parameter-value strategy (e.g. pull real distributions from Query Store or a stats histogram, or map more predicate shapes), extend `scripts/discover.py` — `derive_combos_from_data()` is the data-anchored generator that keeps the workload generic across procs.

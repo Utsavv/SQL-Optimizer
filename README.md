@@ -41,11 +41,15 @@ python -m scripts.optimize \
 
 Add `--actual` to capture runtime stats (executes the proc — **non-prod only**).
 
+Works against **any** stored procedure — just change `--proc`. The workload is
+derived from the target proc's own column ranges, so no per-proc setup is
+needed. `examples/worldwideimporters/` is one fully worked run for reference.
+
 ## Architecture
 
 | Module | Role | LLM? |
 |---|---|---|
-| `discover.py` | parameter space → workload combos | no |
+| `discover.py` | parameter space → workload combos, **auto-derived from the proc's real data** | no |
 | `capture.py` | execution plan + runtime capture | no |
 | `analyze.py` | deterministic plan scoring | no |
 | `llm.py` | propose one safe change as JSON | **yes** |
@@ -63,6 +67,8 @@ and testable offline.
 ## Status
 
 Scaffold / v0. The deterministic pipeline (discover + analyze) is tested
-offline. The DB-facing steps need a live SQL Server to exercise. Robust
-CREATE/ALTER parsing for the sandbox clone and automatic value extraction from
-Query Store are the next enhancements.
+offline, including the data-derived workload generator (`derive_combos_from_data`)
+that makes the skill generic across procedures. The DB-facing steps need a live
+SQL Server to exercise. Mining concrete argument values from Query Store and
+mapping more predicate shapes (multi-column, function-wrapped) are the next
+enhancements.
