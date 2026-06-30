@@ -63,6 +63,9 @@ The same flow applies to every proc — substitute the name and connection; noth
 ### Typical entry point
 
 ```bash
+# Run from the sp-optimizer/ subdirectory — it holds the scripts/ package.
+# (Running from the parent repo root fails: ModuleNotFoundError: No module named 'scripts'.)
+cd sp-optimizer
 python -m scripts.optimize \
   --proc "<schema>.<your_proc>" \
   --backend litellm --model "gemini/gemini-1.5-flash" \
@@ -75,6 +78,20 @@ python -m scripts.optimize \
 # --model defaults to LLM_MODEL (.env), or ollama_chat/gemma4 against a local
 # Ollama server (http://localhost:11434) if neither is set.
 # add --actual to capture runtime stats (executes the proc — non-prod only).
+```
+
+PowerShell equivalent:
+
+```powershell
+# Run from the sp-optimizer/ subdirectory — it holds the scripts/ package.
+# (Running from the parent repo root fails: ModuleNotFoundError: No module named 'scripts'.)
+cd sp-optimizer
+python -m scripts.optimize `
+  --proc "<schema>.<your_proc>" `
+  --backend litellm --model "gemini/gemini-1.5-flash" `
+  --max-iterations 5 `
+  --target-fraction 0.8 `
+  --out-dir out
 ```
 
 Walk through the modules in this order when reading or extending the code:

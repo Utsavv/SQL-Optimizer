@@ -1,17 +1,33 @@
 #!/usr/bin/env bash
 # Deploy WorldWideImporters (OLTP) to an existing Azure SQL Server using sqlpackage.
-# Targets: utsavsqlserver.database.windows.net / WorldWideImport
 # Usage:
+#   export SQL_SERVER='your-server.database.windows.net'
+#   export SQL_DB='WideWorldImporters'
+#   export SQL_ADMIN='sqladmin'
+#   export SQL_ADMIN_PASSWORD='YourStr0ngP@ssword!'
 #   bash deploy_wwi_existing.sh
 set -euo pipefail
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-SQL_SERVER="utsavsqlserver.database.windows.net"
-SQL_DB="WorldWideImport"
-SQL_ADMIN="utsav"
-SQL_ADMIN_PASSWORD="${SQL_ADMIN_PASSWORD:-@ATISecure1}"
+# ─── Configuration (all overridable via environment) ──────────────────────────
+SQL_SERVER="${SQL_SERVER:-}"
+SQL_DB="${SQL_DB:-WideWorldImporters}"
+SQL_ADMIN="${SQL_ADMIN:-sqladmin}"
 BACPAC_URL="https://github.com/microsoft/sql-server-samples/releases/download/wide-world-importers-v1.0/WideWorldImporters-Standard.bacpac"
 BACPAC_FILE="${TMPDIR:-/tmp}/WideWorldImporters-Standard.bacpac"
+
+# ─── Preflight: required, never-defaulted credentials ─────────────────────────
+# The password must never be baked into a committed script; require it from the
+# environment (same contract as deploy_wwi_free.sh).
+if [[ -z "$SQL_SERVER" ]]; then
+  echo "ERROR: SQL_SERVER is required (e.g. your-server.database.windows.net)." >&2
+  echo "  export SQL_SERVER='your-server.database.windows.net'" >&2
+  exit 1
+fi
+if [[ -z "${SQL_ADMIN_PASSWORD:-}" ]]; then
+  echo "ERROR: SQL_ADMIN_PASSWORD is required." >&2
+  echo "  export SQL_ADMIN_PASSWORD='YourStr0ngP@ssword!'" >&2
+  exit 1
+fi
 
 echo "──────────────────────────────────────────────────────────"
 echo "  SQL-Optimizer: WorldWideImporters Import (direct)"

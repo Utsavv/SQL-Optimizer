@@ -220,6 +220,30 @@ print(response.choices[0].message.content)
 `scripts/llm.py`'s `LiteLLMBackend` reads `LLM_MODEL` from `.env` by default,
 or pass `--model` on the CLI to override per run.
 
+#### API key vs. Claude/ChatGPT subscription
+
+`LiteLLMBackend` calls each provider's **developer API** (`api.anthropic.com`,
+`api.openai.com`, ...), which is billed per token and authenticated with an
+**API key** — *not* a consumer **Claude Pro/Max** or **ChatGPT Plus/Pro**
+subscription. Those subscriptions power the chat products (claude.ai,
+chatgpt.com) and don't expose a programmatic endpoint LiteLLM can call, so they
+can't be dropped in where an API key is expected.
+
+To drive the decision step from a subscription instead of a paid API key, use
+the **`FileBackend`** path (no API key required):
+
+1. Run an external agent under your subscription — e.g. **Claude Code**, which
+   supports Claude Pro/Max login — and have it make the "propose one
+   smallest-safe change" decisions.
+2. Write those decisions to a JSON file in the same shape `LiteLLMBackend`
+   emits (a JSON array of `{kind, rationale, apply_sql, rollback_sql,
+   target_object}` objects).
+3. Point the loop at it: `--backend file --decisions <path>`. `FileBackend`
+   replays each staged decision in order — zero per-token API billing.
+
+In short: in-process LLM call → needs an API key (`LiteLLMBackend`); external
+subscription-backed agent → no key (`FileBackend`).
+
 ## Why this is different from existing tools
 
 Existing tools (PerformanceStudio, PerformanceMonitor, SQL MCP Server) do

@@ -49,14 +49,18 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
     # symptom of a missing access path. We gate on estimated rows so a tiny
     # scan (already cheap) isn't punished like a full-table sweep.
     scan_count = 0
+    scan_penalty_total = 0.0
     for rel in _findall(root, "RelOp"):
         phys = rel.get("PhysicalOp", "")
         est_rows = float(rel.get("EstimateRows", "0") or 0)
         if phys in _FULL_SCAN_OPS and est_rows >= 10000:
             scan_count += 1
             penalty = min(20.0, 5.0 + est_rows / 50000.0)
-            score -= penalty
+            scan_penalty_total += penalty
             warnings.append(f"{phys} (~{est_rows:.0f} est rows)")
+    # Cap total scan penalty so multi-statement procs (N sequential INSERTs)
+    # don't accumulate N×penalties and zero out the score unconditionally.
+    score -= min(40.0, scan_penalty_total)
     signals["table_scan_count"] = scan_count
 
     # --- missing index suggestions ---
@@ -84,22 +88,34 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
     signals["spill_count"] = spills
 
     # --- implicit conversions in predicates (sniffing/SARGability red flag) ---
+    # Only count conversions inside Predicate or SeekPredicates elements.
+    # Conversions inside ComputeScalar/concatenation are harmless type promotions
+    # and must not be reported as SARGability issues.
     conversions = 0
-    for conv in _findall(root, "Convert"):
-        if conv.get("Implicit") == "1":
-            conversions += 1
+    predicate_roots = (
+        _findall(root, "Predicate")
+        + _findall(root, "SeekPredicates")
+    )
+    for pred in predicate_roots:
+        for conv in pred.findall(".//sp:Convert", NS):
+            if conv.get("Implicit") == "1":
+                conversions += 1
     if conversions:
         score -= min(10.0, conversions * 2.0)
-        warnings.append(f"{conversions} implicit conversion(s)")
+        warnings.append(f"{conversions} implicit conversion(s) in predicate(s)")
     signals["implicit_conversion_count"] = conversions
 
     # --- estimated vs actual row skew (only present in actual plans) ---
     skew_ops = 0
     for rel in _findall(root, "RelOp"):
         est = float(rel.get("EstimateRows", "0") or 0)
-        rt = rel.find(".//sp:RunTimeInformation/sp:RunTimeCountersPerThread", NS)
-        if rt is not None:
-            actual = float(rt.get("ActualRows", "0") or 0)
+        # Each RelOp carries its OWN runtime counters as a direct child; using a
+        # descendant axis (.//) here would let an outer operator pick up a nested
+        # child's counters and compare them against the parent's estimate, so
+        # match only the immediate child (same pattern as capture._attach_runtime).
+        rts = rel.findall("./sp:RunTimeInformation/sp:RunTimeCountersPerThread", NS)
+        if rts:
+            actual = sum(float(rt.get("ActualRows", "0") or 0) for rt in rts)
             if est > 0 and (actual / est > 10 or est / max(actual, 1) > 10):
                 skew_ops += 1
     if skew_ops:
