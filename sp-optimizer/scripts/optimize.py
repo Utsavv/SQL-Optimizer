@@ -106,6 +106,7 @@ def run_loop(
     history: list[IterationResult] = []
     current_proc = proc_name
     prev_aggregate = -1.0
+    stall_streak = 0
 
     for it in range(max_iterations):
         proc_def = get_proc_text(cursor, current_proc)
@@ -143,10 +144,15 @@ def run_loop(
             run.log(f"[iter {it}] STOP — target met: {frac:.0%} good, agg={agg:.1f}")
             break
 
-        # termination: stalled
-        if it > 0 and agg <= prev_aggregate + 0.5:
+        # termination: stalled (require 2 consecutive no-improvement rounds)
+        if agg > prev_aggregate + 0.5:
+            stall_streak = 0
+        else:
+            stall_streak += 1
+        if it > 0 and stall_streak >= 2:
             history.append(result)
-            run.log(f"[iter {it}] STOP — stalled (agg={agg:.1f} vs prev {prev_aggregate:.1f})")
+            run.log(f"[iter {it}] STOP — stalled {stall_streak} consecutive round(s) "
+                    f"(agg={agg:.1f} vs prev {prev_aggregate:.1f})")
             break
 
         # decision step
