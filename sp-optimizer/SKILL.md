@@ -47,7 +47,7 @@ Stop the loop when ANY of these is true:
 1. **Never modify the live procedure.** All changes are applied to a sandbox copy (`<proc>_opt_v<n>`) or wrapped in an explicit transaction the user must approve before commit.
 2. **Read-only by default for plan capture.** Use estimated plans + Query Store where possible; only run actual execution against non-production or with explicit user confirmation.
 3. **Always produce a diff and a rollback script** for any change before applying it.
-4. **Never auto-create indexes on production** without surfacing the cost/space impact and getting confirmation.
+4. **Never auto-create indexes on production** without surfacing the cost/space impact and getting confirmation. Any proposed index must follow `references/indexing-best-practices.md` — an extra index is a permanent write tax, so the bar is deliberately high.
 
 ## Operating procedure for any stored procedure
 
@@ -77,7 +77,7 @@ Walk through the modules in this order when reading or extending the code:
 2. `scripts/capture.py` — execution plan + runtime capture
 3. `scripts/analyze.py` — plan XML scoring (see `references/plan-analysis.md`)
 4. `scripts/optimize.py` — the orchestration loop + LLM decision step
-5. `scripts/llm.py` — pluggable LLM backend (Gemini, Claude, or replay)
+5. `scripts/llm.py` — pluggable LLM backend (Gemini, Claude, or replay); the decision prompt encodes the index discipline from `references/indexing-best-practices.md`
 
 ## LLM backend
 
@@ -100,3 +100,4 @@ A run produces:
 
 - New plan-analysis rules go in `scripts/analyze.py` and are documented in `references/plan-analysis.md`.
 - To add a parameter-value strategy (e.g. pull real distributions from Query Store or a stats histogram, or map more predicate shapes), extend `scripts/discover.py` — `derive_combos_from_data()` is the data-anchored generator that keeps the workload generic across procs.
+- Indexing guidance the LLM must follow when proposing an index lives in `references/indexing-best-practices.md`; keep the `SYSTEM_PROMPT` in `scripts/llm.py` in sync with it.

@@ -27,6 +27,21 @@ Prefer changes in this order:
   3. A SARGability rewrite (remove function-wrapped predicates, fix implicit conversions)
   4. Query/structure rewrite as a last resort
 
+When you propose a nonclustered index (kind="index"), follow SQL Server
+indexing best practices — an extra index is a permanent write tax, so the bar
+is high:
+  - Only propose it when the analysis justifies it (a missing-index signal, a
+    key lookup, or a scan over a large input). Never add an index speculatively.
+  - Order key columns: equality predicates before range predicates, and within
+    the equality columns put the most selective column first.
+  - Use INCLUDE only for columns needed in the SELECT list to make the index
+    covering; do not bloat it — every included column adds write and storage cost.
+  - Do not create an index that overlaps an existing one (e.g. a left-prefix
+    subset); prefer extending or INCLUDE-ing on the existing index instead.
+  - State the write-cost / storage impact in the rationale.
+  - If stale statistics or a hint would fix the plan more cheaply than a new
+    index, prefer that.
+
 Return STRICT JSON only, no markdown, with this exact shape:
 {
   "kind": "option_hint|index|rewrite|recompile|none",
