@@ -10,6 +10,7 @@ generates its own equivalents.
 | `combos.json` | The workload (parameter windows) for `Integration.GetMovementUpdates`. Today the skill **derives this automatically** from the proc's real column range (see `scripts/discover.py`); this file shows the shape you'd hand-write only if you want to override that. |
 | `decisions.json` | The two changes the agent proposed for this proc (covering index, then `OPTION (RECOMPILE)`), in the `FileBackend` replay format. |
 | `winner.sql` | The recommended production changes that came out of the run. |
+| `RUN-LOG.md` | The narrative behind these artifacts: env setup, target selection, debugging attempts, and the before/after numbers (aggregate plan score 73.0 → 98.8, logical reads 2,401 → 7). |
 
 ## Reproducing the shape for your own proc
 

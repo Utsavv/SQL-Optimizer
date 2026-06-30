@@ -1,3 +1,86 @@
+# SQL-Optimizer
+
+An AI-driven toolkit for tuning SQL Server stored procedures. The core of the
+repo is **sp-optimizer**, a [Claude Code skill](https://code.claude.com/docs)
+that runs a closed discover → capture → analyze → decide → apply → verify loop
+against a procedure's real parameter space until it lands on a good plan
+across the majority of realistic calls — not just one lucky compile. The rest
+of the repo is supporting tooling: scripts to stand up a SQL Server test
+database, verify connectivity, and roll back everything an optimizer run
+created.
+
+It directly targets **parameter sniffing**, where a proc compiled for one set
+of arguments performs badly for others.
+
+## Repository layout
+
+| Path | What it is |
+|---|---|
+| `sp-optimizer/` | The optimizer itself: `SKILL.md` (the skill definition), `scripts/` (the Python engine), `references/` (grounding docs used at the decision step), `examples/worldwideimporters/` (one worked run, including `RUN-LOG.md`), `out/` (per-run output, git-ignored) |
+| `.claude/skills/sp-optimizer` | Symlink into `sp-optimizer/` so Claude Code auto-discovers the skill from this repo |
+| `setup/` | One-time environment bootstrap scripts — provision/load a test database, verify connectivity, roll back an optimizer run. Not needed if you already have a SQL Server to point the optimizer at |
+| `setup/deploy_wwi_free.sh` | Provisions a **new** Azure SQL Database (free tier) and loads the WorldWideImporters sample DB into it |
+| `setup/deploy_wwi_existing.sh` | Loads WorldWideImporters into an **existing** Azure SQL Server via `sqlpackage` |
+| `setup/test_connection.py` | Quick connectivity check against `SQL_CONNECTION_STRING` from `.env` |
+| `setup/CLEANUP.sql` | Rollback script — drops every sandbox object (`<proc>_opt_v<n>` clones, added indexes) an optimizer run created |
+| `requirements.txt` | Python deps: `pyodbc`, `python-dotenv`, `litellm` |
+| `.env.example` | Template for `SQL_CONNECTION_STRING` and the LLM backend config — copy to `.env` and fill in |
+
+## Quick start
+
+1. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
+   Requires ODBC Driver 18 for SQL Server. Works against on-prem SQL Server
+   (2016+), Azure SQL MI, and AWS RDS for SQL Server.
+
+2. **Configure connection + LLM backend**
+   ```bash
+   cp .env.example .env
+   # fill in SQL_CONNECTION_STRING, LLM_MODEL, and the matching API key
+   ```
+   `.env` is git-ignored; `.env.example` is the safe-to-commit template.
+
+3. **(Optional) Stand up a test database.** Skip this if you already have a
+   SQL Server to point the optimizer at.
+   - `setup/deploy_wwi_free.sh` — provisions a brand-new Azure SQL Database (free
+     tier) and imports WorldWideImporters into it. Auto-installs the Azure CLI
+     via Homebrew if missing; requires an Azure login and `SQL_ADMIN_PASSWORD`.
+     ```bash
+     export SQL_ADMIN_PASSWORD='YourStr0ngP@ssword!'
+     bash setup/deploy_wwi_free.sh
+     ```
+   - `setup/deploy_wwi_existing.sh` — imports WorldWideImporters into an
+     already-provisioned Azure SQL Server via `sqlpackage` (auto-installed via
+     `dotnet tool` if missing). Edit the `SQL_SERVER`/`SQL_DB`/`SQL_ADMIN`
+     constants at the top of the script to match your server, and set
+     `SQL_ADMIN_PASSWORD` rather than relying on the script default.
+     ```bash
+     export SQL_ADMIN_PASSWORD='YourStr0ngP@ssword!'
+     bash setup/deploy_wwi_existing.sh
+     ```
+   Both scripts print a ready-to-use pyodbc connection string and an example
+   optimizer invocation when they finish.
+
+4. **Verify connectivity**
+   ```bash
+   python setup/test_connection.py
+   ```
+   Connects with `SQL_CONNECTION_STRING` and prints the server version and
+   database name on success.
+
+5. **Run the optimizer** — either ask Claude Code to use the `sp-optimizer`
+   skill in plain language, or drive the engine directly via its CLI. See
+   [sp-optimizer](#sp-optimizer) below.
+
+6. **Clean up.** `setup/CLEANUP.sql` drops every sandbox proc/index an optimizer run
+   created, returning the database to its pre-run state. Adjust the object
+   names at the top of the script to match what your run actually produced
+   (it's written for the `Integration.GetMovementUpdates` example by default).
+
+---
+
 # sp-optimizer
 
 An AI **skill** that iteratively optimizes SQL Server stored procedures by
@@ -5,9 +88,6 @@ running a closed feedback loop: discover the parameter space → capture
 execution plans across it → analyze them deterministically → let an LLM propose
 one smallest-safe change → apply it to a **sandbox copy** → re-verify → repeat
 until the *majority* of parameter calls land on a good plan.
-
-It directly targets **parameter sniffing**, where a proc compiled for one set of
-arguments performs badly for others.
 
 ## What this is
 
@@ -40,8 +120,8 @@ The skill takes over from there. It will:
 
 The skill is **procedure-agnostic**: just name a different proc. The workload is
 derived from each proc's real column ranges, so there's no per-proc setup. See
-`SKILL.md` for the full operating procedure, termination conditions, and the
-non-negotiable safety rules.
+`sp-optimizer/SKILL.md` for the full operating procedure, termination
+conditions, and the non-negotiable safety rules.
 
 ### Talking to the skill
 
@@ -68,6 +148,8 @@ offline.
 | `scripts/analyze.py` | Analyze | deterministic plan-XML scoring | no |
 | `scripts/llm.py` | Decide | propose one safe change as strict JSON; pluggable LiteLLM / file backend | **yes** |
 | `scripts/optimize.py` | Apply + Verify | the loop + sandbox management + CLI + report | no |
+| `scripts/evidence.py` | Capture + Verify | writes per-combo plan XML / IO stats / score JSON into each run's `evidence/` folder | no |
+| `scripts/models.py` | all steps | shared dataclasses for combos, plans, scores, decisions | no |
 
 The skill walks these in order — discover → capture → analyze → decide →
 apply → verify — and loops until a termination condition in `SKILL.md` is met.
@@ -78,6 +160,7 @@ The skill normally invokes this for you, but the same pipeline runs as a CLI whe
 you want to drive it by hand or in CI:
 
 ```bash
+cd sp-optimizer
 python -m scripts.optimize \
   --proc "dbo.usp_GetMemberActivity" \
   --conn "Driver={ODBC Driver 18 for SQL Server};Server=.;Database=Loyalty;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes" \
@@ -132,6 +215,7 @@ print(response.choices[0].message.content)
 | Gemini | `gemini/gemini-1.5-flash` | `GEMINI_API_KEY` |
 | OpenAI | `gpt-4o` | `OPENAI_API_KEY` |
 | Anthropic | `claude-3-5-sonnet-20241022` | `ANTHROPIC_API_KEY` |
+| Ollama (local) | `ollama/<model>` | none — local server |
 
 `scripts/llm.py`'s `LiteLLMBackend` reads `LLM_MODEL` from `.env` by default,
 or pass `--model` on the CLI to override per run.
@@ -150,6 +234,8 @@ workload. That loop — driven by the skill — is the contribution here.
 - Every change carries a rollback; all changes are written to `changes.sql`.
 - Indexes are never auto-created on production without surfacing cost/space
   impact and getting confirmation.
+- `setup/CLEANUP.sql` gives you a known-good rollback path for whatever
+  a run leaves behind.
 
 ## Output
 
@@ -177,9 +263,23 @@ straight to each plan XML and IO-stat file, and an "Evidence & artifacts"
 section indexes the run folder. Nothing the loop reasoned over is left only in
 memory.
 
-`examples/worldwideimporters/` holds one fully worked run for reference
-(a covering index + `OPTION (RECOMPILE)`). It's illustrative only — not required
-to run the skill against your own proc.
+`sp-optimizer/examples/worldwideimporters/` holds one fully worked run for
+reference (a covering index + `OPTION (RECOMPILE)`). It's illustrative only —
+not required to run the skill against your own proc.
+
+## Reference material
+
+- `sp-optimizer/references/` — grounding docs the LLM decision step is checked
+  against: `indexing-best-practices.md`, `plan-analysis.md`,
+  `parameter-discovery.md`, `decision-log.md` (a reusable cache of Microsoft
+  Learn citations, keyed by finding/warning type, so repeat decisions don't
+  re-spend tokens on the same MCP lookup).
+- `sp-optimizer/examples/worldwideimporters/RUN-LOG.md` — a complete worked
+  example: optimizing `Integration.GetMovementUpdates` against
+  WorldWideImporters on Azure SQL, including environment setup, target
+  selection, the debugging history, and the final numbers (aggregate plan
+  score 73.0 → 98.8, logical reads on the narrow 1-day incremental pull
+  2,401 → 7).
 
 ## Status
 
@@ -190,4 +290,3 @@ SQL Server to exercise. Mining concrete argument values from Query Store and
 mapping more predicate shapes (multi-column, function-wrapped) are the next
 enhancements.
 </content>
-</invoke>
