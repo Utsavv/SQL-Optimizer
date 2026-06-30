@@ -70,7 +70,8 @@ python -m scripts.optimize \
   --target-fraction 0.8 \
   --report out/report.html
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
-# --model defaults to LLM_MODEL (.env) if omitted.
+# --model defaults to LLM_MODEL (.env), or ollama_chat/gemma4 against a local
+# Ollama server (http://localhost:11434) if neither is set.
 # add --actual to capture runtime stats (executes the proc — non-prod only).
 ```
 
@@ -107,7 +108,7 @@ indexing patterns on every run.
 
 ## LLM backend
 
-The decision step (step 4) is the only place an LLM is required. It is pluggable: `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with two implementations — `LiteLLMBackend` (default; routes to any provider — OpenAI, Anthropic, Gemini, Azure, Bedrock, etc. — via the `LLM_MODEL` env var / `--model` flag and the matching API key, no code change needed to switch) and `FileBackend` (`--backend file --decisions <path>`), which replays agent-made decisions from JSON when no model API key is available. The analysis and capture steps are deterministic and need no model.
+The decision step (step 4) is the only place an LLM is required. It is pluggable: `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with two implementations — `LiteLLMBackend` (default; routes to any provider — local Ollama, OpenAI, Anthropic, Gemini, Azure, Bedrock, etc. — via the `LLM_MODEL` env var / `--model` flag and the matching API key, no code change needed to switch; defaults to `ollama_chat/gemma4` against `http://localhost:11434` when unset) and `FileBackend` (`--backend file --decisions <path>`), which replays agent-made decisions from JSON when no model API key is available. The analysis and capture steps are deterministic and need no model.
 
 The structured JSON prompt that drives the decision step lives in `scripts/llm.py` (`SYSTEM_PROMPT`) — it asks for a single, smallest-safe change plus rationale and a rollback, returned as strict JSON. None of it references any specific procedure, so it applies unchanged to whatever proc you target.
 

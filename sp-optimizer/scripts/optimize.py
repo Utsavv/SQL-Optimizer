@@ -179,8 +179,9 @@ def main(argv=None):
     ap.add_argument("--backend", choices=["litellm", "file"], default="litellm")
     ap.add_argument(
         "--model", default=None,
-        help="LiteLLM model string, e.g. gemini/gemini-1.5-flash, "
-             "claude-3-5-sonnet-20241022, gpt-4o (defaults to LLM_MODEL in .env)",
+        help="LiteLLM model string, e.g. ollama_chat/gemma4, gemini/gemini-1.5-flash, "
+             "claude-3-5-sonnet-20241022, gpt-4o (defaults to LLM_MODEL in .env, "
+             "or ollama_chat/gemma4 against local Ollama if unset)",
     )
     ap.add_argument("--decisions", default=os.environ.get("SP_OPT_DECISIONS"),
                     help="JSON file of pre-decided changes (file backend)")

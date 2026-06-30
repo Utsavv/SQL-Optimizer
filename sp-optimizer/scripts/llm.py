@@ -96,18 +96,33 @@ class LiteLLMBackend:
     """Provider-agnostic backend, routed through LiteLLM.
 
     The provider is selected entirely by the ``model`` string (e.g.
-    ``"gemini/gemini-1.5-flash"``, ``"claude-3-5-sonnet-20241022"``,
-    ``"gpt-4o"``) and the matching API key in the environment — no code
-    change is needed to switch providers. See README.md for the model-string
-    / env-var mapping for each provider.
+    ``"ollama_chat/gemma4"``, ``"gemini/gemini-1.5-flash"``,
+    ``"claude-3-5-sonnet-20241022"``, ``"gpt-4o"``) and the matching API key
+    in the environment — no code change is needed to switch providers. See
+    README.md for the model-string / env-var mapping for each provider.
+
+    Defaults to a local Ollama model (``ollama_chat/gemma4`` against
+    ``http://localhost:11434``, the same ``/api/chat`` endpoint used by
+    ``curl http://localhost:11434/api/chat``), so the loop runs out of the
+    box with no API key as long as Ollama is running locally.
     """
 
-    def __init__(self, model: Optional[str] = None, temperature: float = 0.2):
-        self.model_name = model or os.environ.get("LLM_MODEL", "gemini/gemini-1.5-flash")
+    def __init__(
+        self,
+        model: Optional[str] = None,
+        temperature: float = 0.2,
+        api_base: Optional[str] = None,
+    ):
+        self.model_name = model or os.environ.get("LLM_MODEL", "ollama_chat/gemma4")
         self.temperature = temperature
+        self.api_base = api_base or os.environ.get("OLLAMA_API_BASE", "http://localhost:11434")
 
     def propose_change(self, proc_text: str, scores: list[PlanScore]) -> Change:
         from litellm import completion
+
+        kwargs = {}
+        if self.model_name.startswith("ollama"):
+            kwargs["api_base"] = self.api_base
 
         resp = completion(
             model=self.model_name,
@@ -116,6 +131,7 @@ class LiteLLMBackend:
                 {"role": "user", "content": build_user_prompt(proc_text, scores)},
             ],
             temperature=self.temperature,
+            **kwargs,
         )
         text = resp.choices[0].message.content
         return _parse_change(text)
