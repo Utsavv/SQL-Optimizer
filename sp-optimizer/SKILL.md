@@ -68,7 +68,9 @@ python -m scripts.optimize \
   --backend litellm --model "gemini/gemini-1.5-flash" \
   --max-iterations 5 \
   --target-fraction 0.8 \
-  --report out/report.html
+  --out-dir out
+# Each run lands in out/<schema.proc>/<timestamp>/ with the report, run.log,
+# changes.sql, winner.sql, manifest.json, and the evidence/ folder.
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
 # --model defaults to LLM_MODEL (.env), or ollama_chat/gemma4 against a local
 # Ollama server (http://localhost:11434) if neither is set.
@@ -114,10 +116,38 @@ The structured JSON prompt that drives the decision step lives in `scripts/llm.p
 
 ## Output
 
-A run produces:
-- A self-contained HTML report (`report.html`): a baseline-vs-final summary, a "what was tried" timeline, and per-iteration workload scores with the change applied (what + why) and its apply/rollback SQL.
+Every run gets its **own folder**, namespaced by procedure and timestamp, so
+runs never collide and each is fully self-contained:
+
+```
+out/<schema.proc>/<YYYY-MM-DD_HHMMSS>/
+  report.html      self-contained HTML report (links into evidence/)
+  run.log          structured, timestamped step-by-step log of the whole loop
+  changes.sql      every applied change + its rollback, in order
+  winner.sql       the best-performing procedure variant + the changes that produced it
+  manifest.json    machine-readable index of every iteration, combo, and evidence file
+  evidence/
+    iter<n>/
+      <combo>.plan.xml        the execution plan captured for that combo
+      <combo>.statistics.txt  SET STATISTICS IO/TIME text (actual mode)
+      <combo>.score.json      the deterministic analysis: score, warnings, signals
+```
+
+The base directory is `out` by default; override with `--out-dir`. The report
+path can be overridden with `--report` (defaults to `report.html` inside the
+run folder).
+
+**Evidence capture is the contract:** every plan and IO stat captured at every
+step is written to disk under `evidence/` and **referenced from the report** —
+the per-combo table links straight to each plan XML and IO-stat file, and an
+"Evidence & artifacts" section lists the run folder and every artifact. Nothing
+the loop reasoned over is left only in memory.
+
+- A self-contained HTML report (`report.html`): a baseline-vs-final summary, a "what was tried" timeline, per-iteration workload scores with the change applied (what + why) and its apply/rollback SQL, **per-combo links to the raw plan/IO-stat evidence**, and an artifacts index.
 - A `changes.sql` file with every applied change and its rollback.
 - A `winner.sql` containing the best-performing procedure variant.
+- A `run.log` with a timestamped trace of discover → capture → analyze → decide → apply for every iteration.
+- A `manifest.json` indexing every iteration, combo, score, and evidence path.
 
 ## Examples
 

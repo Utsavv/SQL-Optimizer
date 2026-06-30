@@ -83,7 +83,9 @@ python -m scripts.optimize \
   --conn "Driver={ODBC Driver 18 for SQL Server};Server=.;Database=Loyalty;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes" \
   --backend litellm --model "gemini/gemini-1.5-flash" \
   --max-iterations 5 --target-fraction 0.8 \
-  --report out/report.html
+  --out-dir out
+# Each run lands in out/<schema.proc>/<timestamp>/ (report, run.log, changes.sql,
+# winner.sql, manifest.json, and evidence/). Override the report path with --report.
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
 # --model defaults to LLM_MODEL (.env) if omitted.
 # Add --actual to capture runtime stats (executes the proc — non-prod only).
@@ -151,13 +153,29 @@ workload. That loop — driven by the skill — is the contribution here.
 
 ## Output
 
-A run produces, under the run's output dir:
+Every run gets its **own folder**, namespaced by procedure and timestamp, so
+runs never collide and each run is fully self-contained:
 
-- A self-contained HTML report (`report.html`): a baseline-vs-final summary, a
-  "what was tried" timeline, and per-iteration workload scores with the change
-  applied (what + why) and its apply/rollback SQL.
-- A `changes.sql` with every applied change and its rollback.
-- A `winner.sql` containing the best-performing procedure variant.
+```
+out/<schema.proc>/<YYYY-MM-DD_HHMMSS>/
+  report.html      self-contained HTML report (links into evidence/)
+  run.log          timestamped, step-by-step trace of the whole loop
+  changes.sql      every applied change + its rollback, in order
+  winner.sql       the best-performing procedure variant + the changes that produced it
+  manifest.json    machine-readable index of every iteration, combo, and evidence file
+  evidence/
+    iter<n>/
+      <combo>.plan.xml        execution plan captured for that combo
+      <combo>.statistics.txt  SET STATISTICS IO/TIME text (actual mode)
+      <combo>.score.json      deterministic analysis: score, warnings, signals
+```
+
+**Every piece of evidence captured at every step** — the execution plan and the
+IO statistics for each parameter combo, at each iteration — is written under
+`evidence/` and **referenced from the report**: the per-combo tables link
+straight to each plan XML and IO-stat file, and an "Evidence & artifacts"
+section indexes the run folder. Nothing the loop reasoned over is left only in
+memory.
 
 `examples/worldwideimporters/` holds one fully worked run for reference
 (a covering index + `OPTION (RECOMPILE)`). It's illustrative only — not required

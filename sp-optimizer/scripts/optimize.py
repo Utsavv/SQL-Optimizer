@@ -22,6 +22,7 @@ except ImportError:
     pass  # python-dotenv not installed; rely on environment variables directly
 
 from . import analyze, capture, discover
+from .evidence import RunDir
 from .llm import FileBackend, LiteLLMBackend, LLMBackend
 from .models import (
     Change,
@@ -89,6 +90,7 @@ def run_loop(
     cursor,
     proc_name: str,
     backend: LLMBackend,
+    run: RunDir,
     max_iterations: int = 5,
     target_fraction: float = 0.8,
     quality_threshold: float = 75.0,
@@ -97,39 +99,63 @@ def run_loop(
     max_combos: int = 12,
 ) -> list[IterationResult]:
     params, combos = discover.discover(cursor, proc_name, max_combos=max_combos)
+    run.log(
+        f"discover · {len(params)} param(s), {len(combos)} workload combo(s): "
+        + ", ".join(c.label or "default" for c in combos)
+    )
     history: list[IterationResult] = []
     current_proc = proc_name
     prev_aggregate = -1.0
 
     for it in range(max_iterations):
+        proc_def = get_proc_text(cursor, current_proc)
+        mode = "actual" if use_actual else "estimated"
+        run.log(f"[iter {it}] capture ({mode}) of {current_proc} across {len(combos)} combo(s)")
         caps = capture.capture_workload(cursor, current_proc, combos, actual=use_actual)
         scores = analyze.analyze_workload(caps)
+
+        # Persist every piece of evidence for this iteration and link it onto
+        # the scores so the report can point straight at the raw plan / IO stats.
+        for ordinal, (cap, score) in enumerate(zip(caps, scores)):
+            plan_rel, stats_rel = run.write_evidence(it, ordinal, cap, score)
+            score.plan_path = plan_rel
+            score.stats_path = stats_rel
+            note = "ok" if not cap.error else f"ERROR: {cap.error}"
+            run.log(
+                f"[iter {it}]   combo '{cap.combo.label or 'default'}' "
+                f"score={score.score:.1f} plan={plan_rel or '—'} "
+                f"stats={stats_rel or '—'} ({note})",
+                echo=False,
+            )
+
         agg = workload_score(scores, combos)
         frac = fraction_good(scores, quality_threshold)
 
         result = IterationResult(
-            iteration=it, scores=scores, aggregate_score=agg, fraction_good=frac
+            iteration=it, scores=scores, aggregate_score=agg, fraction_good=frac,
+            scored_proc=current_proc, proc_def=proc_def,
         )
+        run.log(f"[iter {it}] analyze · aggregate={agg:.1f} · {frac:.0%} of combos ≥ {quality_threshold:.0f}")
 
         # termination: good enough
         if frac >= target_fraction:
             history.append(result)
-            print(f"[iter {it}] target met: {frac:.0%} good, agg={agg:.1f}")
+            run.log(f"[iter {it}] STOP — target met: {frac:.0%} good, agg={agg:.1f}")
             break
 
         # termination: stalled
         if it > 0 and agg <= prev_aggregate + 0.5:
             history.append(result)
-            print(f"[iter {it}] stalled (agg={agg:.1f} vs prev {prev_aggregate:.1f})")
+            run.log(f"[iter {it}] STOP — stalled (agg={agg:.1f} vs prev {prev_aggregate:.1f})")
             break
 
         # decision step
-        proc_text = get_proc_text(cursor, current_proc)
-        change = backend.propose_change(proc_text, scores)
+        change = backend.propose_change(proc_def, scores)
         if change.kind == "none" or not change.apply_sql.strip():
             history.append(result)
-            print(f"[iter {it}] no safe change proposed; stopping")
+            run.log(f"[iter {it}] STOP — no safe change proposed")
             break
+        run.log(f"[iter {it}] decide · {change.kind} on {change.target_object}: {change.rationale}", echo=False)
 
         # apply to a fresh sandbox, then verify next iteration
         sandbox = make_sandbox(cursor, proc_name, it + 1)
@@ -140,14 +166,14 @@ def run_loop(
         except Exception as e:
             result.regressions.append(f"apply failed: {e}")
             history.append(result)
-            print(f"[iter {it}] apply failed: {e}")
+            run.log(f"[iter {it}] apply FAILED on sandbox {sandbox}: {e}")
             break
 
         result.change_applied = change
         history.append(result)
         current_proc = sandbox
         prev_aggregate = agg
-        print(f"[iter {it}] applied {change.kind}: {change.target_object} (agg={agg:.1f})")
+        run.log(f"[iter {it}] applied {change.kind}: {change.target_object} → sandbox {sandbox} (agg={agg:.1f})")
 
     return history
 
@@ -191,7 +217,11 @@ def main(argv=None):
     ap.add_argument("--max-combos", type=int, default=12)
     ap.add_argument("--actual", action="store_true",
                     help="run ACTUAL plans (executes proc — non-prod only)")
-    ap.add_argument("--report", default="report.html")
+    ap.add_argument("--out-dir", default="out",
+                    help="base output dir; each run lands in "
+                         "<out-dir>/<schema.proc>/<timestamp>/ (default: out)")
+    ap.add_argument("--report", default=None,
+                    help="report path override (default: report.html inside the run dir)")
     args = ap.parse_args(argv)
 
     if not args.conn:
@@ -213,20 +243,41 @@ def main(argv=None):
     conn = pyodbc.connect(args.conn, autocommit=True)
     cursor = conn.cursor()
 
-    history = run_loop(
-        cursor,
-        args.proc,
-        backend,
-        max_iterations=args.max_iterations,
-        target_fraction=args.target_fraction,
-        quality_threshold=args.quality_threshold,
-        use_actual=args.actual,
-        max_combos=args.max_combos,
-    )
+    # Each run gets its OWN folder: <out-dir>/<schema.proc>/<timestamp>/.
+    run = RunDir(args.out_dir, args.proc)
+    try:
+        history = run_loop(
+            cursor,
+            args.proc,
+            backend,
+            run,
+            max_iterations=args.max_iterations,
+            target_fraction=args.target_fraction,
+            quality_threshold=args.quality_threshold,
+            use_actual=args.actual,
+            max_combos=args.max_combos,
+        )
 
-    Path(args.report).parent.mkdir(parents=True, exist_ok=True)
-    write_report(history, args.report, proc_name=args.proc)
-    print(f"\nDone. {len(history)} iterations. Report: {args.report}")
+        # End-of-run artifacts, all inside the run folder alongside the evidence.
+        run.write_changes(history)
+        best = run.write_winner(history)
+        run.write_manifest(history, args.proc)
+
+        report_path = Path(args.report) if args.report else run.report_path
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        write_report(history, str(report_path), proc_name=args.proc, run=run)
+
+        run.log(
+            f"run complete · {len(history)} iteration(s) · "
+            f"winner=iter {best.iteration if best else '—'} · report={report_path}"
+        )
+        print(f"\nDone. {len(history)} iteration(s). Run folder: {run.root}")
+        print(f"  report:  {report_path}")
+        print(f"  log:     {run.log_path}")
+        print(f"  changes: {run.changes_path}")
+        print(f"  winner:  {run.winner_path}")
+    finally:
+        run.close()
     return 0
 
 
@@ -424,18 +475,55 @@ def _render_iteration(r: IterationResult) -> str:
             f'<td class="num">{_esc(_fmt(s.cpu_ms))}</td>'
             f'<td class="num">{_esc(_fmt(s.logical_reads))}</td>'
             f'<td class="num">{_esc(_fmt(s.output_rows))}</td>'
+            f'<td class="evidence-cell">{_evidence_links(s)}</td>'
             f'<td class="warn-cell">{_esc(warn) if warn else ""}</td></tr>'
         )
     parts.append(
-        '<h3>Per-combo plan scores &amp; runtime stats</h3>'
+        '<h3>Per-combo plan scores, runtime stats &amp; evidence</h3>'
         '<div class="table-wrap"><table>'
         '<thead><tr><th>Combo</th><th class="num">Score</th><th class="num">Elapsed (ms)</th>'
         '<th class="num">CPU (ms)</th><th class="num">Logical reads</th>'
-        '<th class="num">Rows out</th><th>Warnings</th></tr></thead>'
+        '<th class="num">Rows out</th><th>Evidence</th><th>Warnings</th></tr></thead>'
         f'<tbody>{"".join(rows)}</tbody></table></div>'
     )
     parts.append('</section>')
     return "".join(parts)
+
+
+def _evidence_links(s) -> str:
+    """Links to the persisted plan XML / IO-stat text for one combo, if any."""
+    links = []
+    if s.plan_path:
+        links.append(f'<a href="{_esc(s.plan_path)}">plan</a>')
+    if s.stats_path:
+        links.append(f'<a href="{_esc(s.stats_path)}">IO stats</a>')
+    return " · ".join(links) if links else '<span class="muted">—</span>'
+
+
+def _render_artifacts(run) -> str:
+    """A section listing the run folder and every persisted artifact, so the
+    reader knows exactly where the raw evidence lives on disk."""
+    if run is None:
+        return ""
+    items = [
+        ("Run folder", str(run.root)),
+        ("Run log", run.log_path.name),
+        ("Applied changes", run.changes_path.name),
+        ("Winning variant", run.winner_path.name),
+        ("Manifest (JSON)", run.manifest_path.name),
+        ("Raw evidence", "evidence/iter&lt;n&gt;/&lt;combo&gt;.{plan.xml, statistics.txt, score.json}"),
+    ]
+    rows = "".join(
+        f'<tr><td>{_esc(label)}</td><td><code>{val}</code></td></tr>'
+        for label, val in items
+    )
+    return f"""
+    <section class="card" id="artifacts">
+      <h2>Evidence &amp; artifacts</h2>
+      <p class="muted">Every plan and IO stat captured at every step is saved in this run folder
+      and linked from the per-iteration tables above.</p>
+      <div class="table-wrap"><table><tbody>{rows}</tbody></table></div>
+    </section>"""
 
 
 _REPORT_CSS = """
@@ -534,6 +622,10 @@ th { font-size: 11.5px; text-transform: uppercase; letter-spacing: .04em; color:
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 tbody tr:hover { background: #f8faff; }
 .warn-cell { color: var(--warn); font-size: 12.5px; }
+.evidence-cell { font-size: 12.5px; white-space: nowrap; }
+.evidence-cell a { color: var(--accent); text-decoration: none; font-weight: 500; }
+.evidence-cell a:hover { text-decoration: underline; }
+#artifacts code { background: #eef1f6; padding: 2px 7px; border-radius: 6px; font-size: 12.5px; }
 footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top: 24px; }
 @media (max-width: 600px) {
   .progress-row { grid-template-columns: 1fr; gap: 4px; }
@@ -542,7 +634,7 @@ footer { text-align: center; color: var(--muted); font-size: 12.5px; margin-top:
 """
 
 
-def _render_html(history: list[IterationResult], proc_name: str) -> str:
+def _render_html(history: list[IterationResult], proc_name: str, run=None) -> str:
     generated = datetime.now().strftime("%Y-%m-%d %H:%M")
     proc_line = (
         f'<div class="proc">Procedure: <code>{_esc(proc_name)}</code></div>'
@@ -556,13 +648,20 @@ def _render_html(history: list[IterationResult], proc_name: str) -> str:
     else:
         nav_links = ['<a href="#summary">Summary</a>', '<a href="#tried">What was tried</a>']
         nav_links += [f'<a href="#iter-{r.iteration}">Iter {r.iteration}</a>' for r in history]
+        if run is not None:
+            nav_links.append('<a href="#artifacts">Evidence</a>')
         nav = f'<nav class="jump">{"".join(nav_links)}</nav>'
         body = (
             _render_summary(history, proc_name)
             + _render_timeline(history)
             + "".join(_render_iteration(r) for r in history)
+            + _render_artifacts(run)
         )
 
+    run_line = (
+        f'<div class="generated">Run folder: <code>{_esc(str(run.root))}</code></div>'
+        if run is not None else ""
+    )
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -576,6 +675,7 @@ def _render_html(history: list[IterationResult], proc_name: str) -> str:
   <h1>SP Optimization Report</h1>
   {proc_line}
   <div class="generated">Generated {generated}</div>
+  {run_line}
 </header>
 <div class="page">
 {nav}
@@ -586,10 +686,14 @@ def _render_html(history: list[IterationResult], proc_name: str) -> str:
 </html>"""
 
 
-def write_report(history: list[IterationResult], path: str, proc_name: str = ""):
-    """Write the optimization run as a self-contained HTML report."""
+def write_report(history: list[IterationResult], path: str, proc_name: str = "", run=None):
+    """Write the optimization run as a self-contained HTML report.
+
+    When a ``run`` (RunDir) is supplied, the report links to the per-combo plan
+    XML / IO-stat evidence persisted under the run folder and lists every
+    artifact written for the run."""
     with open(path, "w", encoding="utf-8") as f:
-        f.write(_render_html(history, proc_name))
+        f.write(_render_html(history, proc_name, run=run))
 
 
 if __name__ == "__main__":
