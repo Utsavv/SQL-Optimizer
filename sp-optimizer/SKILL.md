@@ -68,7 +68,7 @@ python -m scripts.optimize \
   --backend litellm --model "gemini/gemini-1.5-flash" \
   --max-iterations 5 \
   --target-fraction 0.8 \
-  --report out/report.md
+  --report out/report.html
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
 # --model defaults to LLM_MODEL (.env) if omitted.
 # add --actual to capture runtime stats (executes the proc — non-prod only).
@@ -114,7 +114,7 @@ The structured JSON prompt that drives the decision step lives in `scripts/llm.p
 ## Output
 
 A run produces:
-- An HTML/Markdown report: per-iteration workload scores, plan thumbnails, the change applied, and before/after comparison.
+- A self-contained HTML report (`report.html`): a baseline-vs-final summary, a "what was tried" timeline, and per-iteration workload scores with the change applied (what + why) and its apply/rollback SQL.
 - A `changes.sql` file with every applied change and its rollback.
 - A `winner.sql` containing the best-performing procedure variant.
 

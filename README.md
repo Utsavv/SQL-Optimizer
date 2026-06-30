@@ -83,7 +83,7 @@ python -m scripts.optimize \
   --conn "Driver={ODBC Driver 18 for SQL Server};Server=.;Database=Loyalty;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes" \
   --backend litellm --model "gemini/gemini-1.5-flash" \
   --max-iterations 5 --target-fraction 0.8 \
-  --report out/report.md
+  --report out/report.html
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
 # --model defaults to LLM_MODEL (.env) if omitted.
 # Add --actual to capture runtime stats (executes the proc — non-prod only).
@@ -153,8 +153,9 @@ workload. That loop — driven by the skill — is the contribution here.
 
 A run produces, under the run's output dir:
 
-- A Markdown/HTML report: per-iteration workload scores, the change applied, and
-  a before/after comparison.
+- A self-contained HTML report (`report.html`): a baseline-vs-final summary, a
+  "what was tried" timeline, and per-iteration workload scores with the change
+  applied (what + why) and its apply/rollback SQL.
 - A `changes.sql` with every applied change and its rollback.
 - A `winner.sql` containing the best-performing procedure variant.
 

@@ -37,6 +37,7 @@ odbc*.ini
 
 # Generated outputs
 report.md
+report.html
 *.log
 *.bak
 
