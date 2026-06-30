@@ -131,9 +131,10 @@ class LiteLLMBackend:
                 {"role": "user", "content": build_user_prompt(proc_text, scores)},
             ],
             temperature=self.temperature,
+            stream=False,
             **kwargs,
         )
-        text = resp.choices[0].message.content
+        text = resp.choices[0].message.content or ""  # type: ignore[union-attr]
         return _parse_change(text)
 
 
