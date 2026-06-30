@@ -1,6 +1,9 @@
 # Database connectivity
 pyodbc>=4.0.39
 
+# Environment / secrets
+python-dotenv>=1.0.0
+
 # LLM backends (install at least one)
 anthropic>=0.30.0
 google-cloud-aiplatform>=1.50.0

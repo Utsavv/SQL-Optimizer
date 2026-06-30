@@ -96,6 +96,37 @@ class GeminiBackend:
         return _parse_change(resp.text)
 
 
+class FileBackend:
+    """Replays a list of pre-decided changes from a JSON file.
+
+    Used when the decision step is made by an external agent (e.g. Claude Code
+    driving Microsoft Learn doc lookups) rather than an in-process API call —
+    no ANTHROPIC_API_KEY required. The file is a JSON array of change objects in
+    the same shape ClaudeBackend would emit; each call to ``propose_change``
+    returns the next one. When the list is exhausted it returns ``kind="none"``
+    so the loop terminates cleanly.
+    """
+
+    def __init__(self, path: str):
+        with open(path) as f:
+            self._decisions = json.load(f)
+        self._i = 0
+
+    def propose_change(self, proc_text: str, scores: list[PlanScore]) -> Change:
+        if self._i >= len(self._decisions):
+            return Change(kind="none", rationale="no further staged change", apply_sql="",
+                          rollback_sql="", target_object="")
+        data = self._decisions[self._i]
+        self._i += 1
+        return Change(
+            kind=data.get("kind", "none"),
+            rationale=data.get("rationale", ""),
+            apply_sql=data.get("apply_sql", ""),
+            rollback_sql=data.get("rollback_sql", ""),
+            target_object=data.get("target_object", ""),
+        )
+
+
 class ClaudeBackend:
     """Anthropic Claude backend."""
 

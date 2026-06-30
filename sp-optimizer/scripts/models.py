@@ -30,6 +30,7 @@ class PlanCapture:
     elapsed_ms: Optional[float] = None
     cpu_ms: Optional[float] = None
     logical_reads: Optional[int] = None
+    output_rows: Optional[float] = None
     error: Optional[str] = None
 
 
@@ -42,6 +43,11 @@ class PlanScore:
     missing_indexes: list[str] = field(default_factory=list)
     # raw signals the LLM can reason over
     signals: dict[str, Any] = field(default_factory=dict)
+    # runtime stats carried through from the capture (actual mode only)
+    elapsed_ms: Optional[float] = None
+    cpu_ms: Optional[float] = None
+    logical_reads: Optional[int] = None
+    output_rows: Optional[float] = None
 
 
 @dataclass

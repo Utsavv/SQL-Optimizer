@@ -1,0 +1,16 @@
+[
+  {"values": {"@LastCutoff": "2016-05-30 12:00:00", "@NewCutoff": "2016-05-31 12:00:00"},
+   "label": "narrow: last 1 day (~293 rows)", "weight": 3.0},
+  {"values": {"@LastCutoff": "2016-05-24 12:00:00", "@NewCutoff": "2016-05-31 12:00:00"},
+   "label": "narrow: last 7 days (~1.5k rows)", "weight": 3.0},
+  {"values": {"@LastCutoff": "2016-05-01 12:00:00", "@NewCutoff": "2016-05-31 12:00:00"},
+   "label": "medium: last 30 days (~6.5k rows)", "weight": 2.0},
+  {"values": {"@LastCutoff": "2016-01-01 00:00:00", "@NewCutoff": "2016-04-01 00:00:00"},
+   "label": "medium: Q1 2016", "weight": 2.0},
+  {"values": {"@LastCutoff": "2015-01-01 00:00:00", "@NewCutoff": "2016-01-01 00:00:00"},
+   "label": "wide: full year 2015 (~74k rows)", "weight": 1.0},
+  {"values": {"@LastCutoff": "2013-01-01 00:00:00", "@NewCutoff": "2016-06-01 00:00:00"},
+   "label": "widest: full history (~236k rows)", "weight": 1.0},
+  {"values": {"@LastCutoff": "2016-05-31 12:00:00", "@NewCutoff": "2016-05-31 13:00:00"},
+   "label": "edge: empty window (0 rows)", "weight": 1.0}
+]

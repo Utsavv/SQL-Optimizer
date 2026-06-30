@@ -9,9 +9,13 @@ weighted by estimated subtree cost where available.
 """
 from __future__ import annotations
 
+import math
 import xml.etree.ElementTree as ET
 
 from .models import PlanCapture, PlanScore
+
+# Physical operators that read an entire input (vs. a seek into a subset).
+_FULL_SCAN_OPS = {"Table Scan", "Clustered Index Scan", "Index Scan"}
 
 # ShowPlan namespace
 NS = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -40,16 +44,19 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
     missing: list[str] = []
     signals: dict = {}
 
-    # --- scans on large inputs (penalty scales with estimated rows) ---
+    # --- full scans on large inputs (penalty scales with estimated rows) ---
+    # A full Table/Clustered Index/Index Scan over a large input is the classic
+    # symptom of a missing access path. We gate on estimated rows so a tiny
+    # scan (already cheap) isn't punished like a full-table sweep.
     scan_count = 0
     for rel in _findall(root, "RelOp"):
         phys = rel.get("PhysicalOp", "")
         est_rows = float(rel.get("EstimateRows", "0") or 0)
-        if "Scan" in phys and "Index Scan" not in phys:
+        if phys in _FULL_SCAN_OPS and est_rows >= 10000:
             scan_count += 1
-            penalty = min(20.0, 5.0 + est_rows / 100000.0)
+            penalty = min(20.0, 5.0 + est_rows / 50000.0)
             score -= penalty
-            warnings.append(f"{phys} (~{est_rows:.0f} rows)")
+            warnings.append(f"{phys} (~{est_rows:.0f} est rows)")
     signals["table_scan_count"] = scan_count
 
     # --- missing index suggestions ---
@@ -100,6 +107,22 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
         warnings.append(f"{skew_ops} op(s) with >10x estimate skew (sniffing?)")
     signals["estimate_skew_ops"] = skew_ops
 
+    # --- runtime inefficiency: many logical reads to emit few rows ---
+    # Actual-mode only. Reading the whole table (high logical reads) to return a
+    # small result is the runtime fingerprint of a missing covering index. This
+    # is removed once the seek-friendly index exists.
+    if cap.logical_reads is not None and cap.logical_reads > 500:
+        out_rows = max(cap.output_rows or 0.0, 1.0)
+        reads_per_row = cap.logical_reads / out_rows
+        signals["reads_per_row"] = round(reads_per_row, 1)
+        if reads_per_row > 5.0:
+            penalty = min(25.0, 5.0 + 6.0 * math.log10(reads_per_row))
+            score -= penalty
+            warnings.append(
+                f"{cap.logical_reads} logical reads for {int(out_rows)} row(s) "
+                f"(reads/row={reads_per_row:.1f})"
+            )
+
     score = max(0.0, min(100.0, score))
     return PlanScore(
         combo_label=label,
@@ -107,6 +130,10 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
         warnings=warnings,
         missing_indexes=missing,
         signals=signals,
+        elapsed_ms=cap.elapsed_ms,
+        cpu_ms=cap.cpu_ms,
+        logical_reads=cap.logical_reads,
+        output_rows=cap.output_rows,
     )
 
 

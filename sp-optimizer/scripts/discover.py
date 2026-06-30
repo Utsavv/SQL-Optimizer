@@ -12,10 +12,33 @@ never executes anything destructive.
 """
 from __future__ import annotations
 
+import json
+import os
 from itertools import product
 from typing import Optional
 
 from .models import ParamCombo, ProcParam
+
+
+def _combos_from_env() -> Optional[list[ParamCombo]]:
+    """If SP_OPT_COMBOS points at a JSON file, use those combos verbatim.
+
+    Lets the caller inject a realistic workload (e.g. cutoff dates mined from the
+    actual fact table) instead of the deterministic boundary synthesis, which can
+    fall outside a column's real value range. File shape:
+        [{"values": {"@LastCutoff": "...", "@NewCutoff": "..."},
+          "label": "...", "weight": 1.0}, ...]
+    """
+    path = os.environ.get("SP_OPT_COMBOS")
+    if not path or not os.path.exists(path):
+        return None
+    with open(path) as f:
+        raw = json.load(f)
+    combos = [
+        ParamCombo(values=c["values"], label=c.get("label", ""), weight=float(c.get("weight", 1.0)))
+        for c in raw
+    ]
+    return combos or None
 
 # ---- 1. signature -----------------------------------------------------------
 
@@ -126,7 +149,9 @@ def discover(
 ) -> tuple[list[ProcParam], list[ParamCombo]]:
     """Return (signature, candidate parameter combos)."""
     params = get_signature(cursor, proc_name)
-    # Real-value mining is surfaced to the LLM/caller as a hint set; the
-    # deterministic synthesis below guarantees we always have a workload.
-    combos = synthesize_combos(params, max_combos=max_combos)
+    # A caller-supplied real workload (SP_OPT_COMBOS) wins over synthesis; the
+    # deterministic synthesis below guarantees we always have a workload otherwise.
+    combos = _combos_from_env()
+    if combos is None:
+        combos = synthesize_combos(params, max_combos=max_combos)
     return params, combos

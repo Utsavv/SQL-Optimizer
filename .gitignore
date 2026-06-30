@@ -30,6 +30,7 @@ build/
 # Secrets / environment
 .env
 .env.*
+!.env.example
 *.env
 connection_string.txt
 odbc*.ini
