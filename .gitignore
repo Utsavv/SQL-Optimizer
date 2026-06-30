@@ -41,6 +41,10 @@ report.html
 *.log
 *.bak
 
+# sp-optimizer per-run folders (out/<schema.proc>/<timestamp>/), keep the dir
+sp-optimizer/out/*
+!sp-optimizer/out/.gitkeep
+
 # Azure / cloud
 *.publishsettings
 local.settings.json

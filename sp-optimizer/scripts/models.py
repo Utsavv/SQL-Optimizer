@@ -32,6 +32,9 @@ class PlanCapture:
     logical_reads: Optional[int] = None
     output_rows: Optional[float] = None
     error: Optional[str] = None
+    # Raw SET STATISTICS IO / TIME text (actual mode only). This is the
+    # human-readable IO-stat evidence the report links to alongside the plan.
+    io_stats_text: Optional[str] = None
 
 
 @dataclass
@@ -48,6 +51,10 @@ class PlanScore:
     cpu_ms: Optional[float] = None
     logical_reads: Optional[int] = None
     output_rows: Optional[float] = None
+    # paths (relative to the run dir) to the persisted evidence for this combo,
+    # so the report can link straight to the raw plan XML / IO-stat text.
+    plan_path: Optional[str] = None
+    stats_path: Optional[str] = None
 
 
 @dataclass
@@ -69,6 +76,10 @@ class IterationResult:
     fraction_good: float              # fraction of combos at/above threshold
     change_applied: Optional[Change] = None
     regressions: list[str] = field(default_factory=list)
+    # the procedure variant that was captured/scored this iteration, plus its
+    # full definition — used to pick and write out the winning variant.
+    scored_proc: str = ""
+    proc_def: str = ""
 
 
 def workload_score(scores: list[PlanScore], combos: list[ParamCombo]) -> float:

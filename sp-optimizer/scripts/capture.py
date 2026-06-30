@@ -10,6 +10,7 @@ is never touched.
 """
 from __future__ import annotations
 
+import re
 import xml.etree.ElementTree as ET
 from typing import Optional
 
@@ -95,6 +96,27 @@ def capture_estimated(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
         return PlanCapture(combo=combo, plan_xml="", error=str(e))
 
 
+def _drain_messages(cursor, sink: list[str]) -> None:
+    """Collect any pending informational messages (SET STATISTICS IO / TIME
+    output arrives here, not as a result set) into ``sink``. Best-effort: the
+    driver may not expose ``cursor.messages`` at all, in which case we no-op.
+
+    pyodbc populates ``cursor.messages`` as a list of ``(state, text)`` tuples
+    for the most recent operation and clears it on the next one, so this must be
+    called once per result set (before ``nextset``) to catch everything."""
+    msgs = getattr(cursor, "messages", None)
+    if not msgs:
+        return
+    for m in msgs:
+        text = m[1] if isinstance(m, (list, tuple)) and len(m) > 1 else str(m)
+        # The ODBC layer prefixes driver/source tags like
+        # "[Microsoft][ODBC Driver 18 for SQL Server][SQL Server]"; strip the
+        # leading bracket run so the IO-stat text reads cleanly.
+        cleaned = re.sub(r"^(\[[^\]]*\])+", "", str(text)).strip()
+        if cleaned and (not sink or sink[-1] != cleaned):
+            sink.append(cleaned)
+
+
 def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
     """Actual plan + runtime stats. EXECUTES the proc — non-prod / confirmed only.
 
@@ -102,11 +124,14 @@ def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
     set followed by a single-cell result set holding the actual ShowPlan XML.
     We must FULLY drain each data set (so the statement runs to completion and
     the actual row counts are accurate) and then pick out the XML set, which is
-    the last result set after the data."""
+    the last result set after the data. SET STATISTICS IO / TIME are also turned
+    on so the per-table logical/physical read counts and CPU/elapsed timings are
+    captured as text evidence (collected from the message stream)."""
     args = _arg_list(combo)
     exec_stmt = f"EXEC {proc_name} {args};" if args else f"EXEC {proc_name};"
+    io_msgs: list[str] = []
     try:
-        cursor.execute("SET STATISTICS XML ON;")
+        cursor.execute("SET STATISTICS XML ON; SET STATISTICS IO ON; SET STATISTICS TIME ON;")
         cursor.execute(exec_stmt)
         plan_xml = ""
         while True:
@@ -119,18 +144,28 @@ def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
                 # The actual-plan result set is a single row with a single XML cell.
                 if len(first) == 1 and isinstance(first[0], str) and first[0].lstrip().startswith("<"):
                     plan_xml = first[0]
+            _drain_messages(cursor, io_msgs)
             if not cursor.nextset():
                 break
-        cursor.execute("SET STATISTICS XML OFF;")
-        cap = PlanCapture(combo=combo, plan_xml=plan_xml)
+        _drain_messages(cursor, io_msgs)
+        cursor.execute("SET STATISTICS XML OFF; SET STATISTICS IO OFF; SET STATISTICS TIME OFF;")
+        cap = PlanCapture(
+            combo=combo,
+            plan_xml=plan_xml,
+            io_stats_text="\n".join(io_msgs).strip() or None,
+        )
         _attach_runtime(cap)
         return cap
     except Exception as e:
         try:
-            cursor.execute("SET STATISTICS XML OFF;")
+            cursor.execute("SET STATISTICS XML OFF; SET STATISTICS IO OFF; SET STATISTICS TIME OFF;")
         except Exception:
             pass
-        return PlanCapture(combo=combo, plan_xml="", error=str(e))
+        return PlanCapture(
+            combo=combo, plan_xml="",
+            io_stats_text="\n".join(io_msgs).strip() or None,
+            error=str(e),
+        )
 
 
 def capture_workload(
