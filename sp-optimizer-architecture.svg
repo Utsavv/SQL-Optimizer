@@ -1,0 +1,104 @@
+<svg viewBox="0 0 940 700" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" role="img" aria-labelledby="t d">
+  <title id="t">sp-optimizer architecture</title>
+  <desc id="d">A vertical flow: inputs feed a Discover step that derives a workload, then a repeating loop of Capture, Analyze, Decide, Apply and Verify. The Decide step consults a self-learning decision-log cache backed by the Microsoft Learn MCP. On termination the loop emits a run folder of outputs.</desc>
+
+  <defs>
+    <marker id="ah" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto-start-reverse">
+      <path d="M0,0 L6,3 L0,6 Z" fill="#8c887e"/>
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="940" height="700" fill="#ffffff"/>
+
+  <text x="470" y="30" text-anchor="middle" font-size="20" font-weight="700" fill="#26231d">sp-optimizer architecture</text>
+  <text x="470" y="50" text-anchor="middle" font-size="12" fill="#6b665d">An AI feedback loop that tunes SQL Server stored procedures across a whole workload</text>
+
+  <rect x="290" y="66" width="360" height="48" rx="9" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <text x="304" y="83" font-size="9" letter-spacing="1" fill="#9a958c">INPUTS</text>
+  <text x="470" y="100" text-anchor="middle" font-size="12.5" fill="#26231d">--proc &#160;·&#160; connection string &#160;·&#160; LLM backend</text>
+  <path d="M470,114 L470,138" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+
+  <rect x="170" y="140" width="600" height="62" rx="9" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <rect x="170" y="140" width="4" height="62" rx="2" fill="#7f77dd"/>
+  <text x="188" y="162" font-size="12" font-weight="700" fill="#7f77dd">1 · DISCOVER</text>
+  <text x="188" y="180" font-size="11.5" fill="#6b665d">Reads sys.parameters, derives the workload from the proc's own data</text>
+  <text x="188" y="196" font-size="11" fill="#9a958c">windows:  narrow → medium → wide → empty  (exposes parameter sniffing)</text>
+  <path d="M470,202 L470,222" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+
+  <rect x="40" y="222" width="860" height="200" rx="12" fill="#efece4" stroke="#c7c2b6" stroke-dasharray="5 4"/>
+  <text x="60" y="247" font-size="12.5" font-weight="700" fill="#26231d">THE LOOP</text>
+  <text x="146" y="247" font-size="11" fill="#6b665d">repeat until a termination condition is met</text>
+  <rect x="556" y="232" width="324" height="22" rx="11" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <text x="718" y="247" text-anchor="middle" font-size="10" fill="#6b665d">stop: ≥80% combos good · no regressions · ≤5 iters</text>
+
+  <path d="M800,300 L800,278 L140,278 L140,300" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="470" y="273" text-anchor="middle" font-size="10" fill="#9a958c">repeat</text>
+
+  <rect x="70" y="300" width="140" height="80" rx="8" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <line x1="70" y1="302" x2="210" y2="302" stroke="#7f77dd" stroke-width="2.5"/>
+  <text x="82" y="324" font-size="11.5" font-weight="700" fill="#7f77dd">2 · Capture</text>
+  <text x="82" y="342" font-size="10.5" fill="#6b665d">plans + IO stats</text>
+  <text x="82" y="362" font-size="9" fill="#9a958c">per combo</text>
+
+  <rect x="235" y="300" width="140" height="80" rx="8" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <line x1="235" y1="302" x2="375" y2="302" stroke="#7f77dd" stroke-width="2.5"/>
+  <text x="247" y="324" font-size="11.5" font-weight="700" fill="#7f77dd">3 · Analyze</text>
+  <text x="247" y="342" font-size="10.5" fill="#6b665d">score plan XML</text>
+  <rect x="247" y="352" width="74" height="16" rx="8" fill="#efece4" stroke="#d8d4ca"/>
+  <text x="284" y="363" text-anchor="middle" font-size="9" fill="#9a958c">0 tokens</text>
+
+  <rect x="400" y="300" width="140" height="80" rx="8" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <line x1="400" y1="302" x2="540" y2="302" stroke="#7f77dd" stroke-width="2.5"/>
+  <text x="412" y="324" font-size="11.5" font-weight="700" fill="#7f77dd">4 · Decide</text>
+  <text x="412" y="342" font-size="10.5" fill="#6b665d">one safe change</text>
+  <rect x="412" y="352" width="50" height="16" rx="8" fill="#efece4" stroke="#d8d4ca"/>
+  <text x="437" y="363" text-anchor="middle" font-size="9" fill="#9a958c">LLM</text>
+
+  <rect x="565" y="300" width="140" height="80" rx="8" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <line x1="565" y1="302" x2="705" y2="302" stroke="#7f77dd" stroke-width="2.5"/>
+  <text x="577" y="324" font-size="11.5" font-weight="700" fill="#7f77dd">5 · Apply</text>
+  <text x="577" y="342" font-size="10.5" fill="#6b665d">to sandbox copy</text>
+  <text x="577" y="362" font-size="9" fill="#9a958c">diff + rollback</text>
+
+  <rect x="730" y="300" width="140" height="80" rx="8" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <line x1="730" y1="302" x2="870" y2="302" stroke="#7f77dd" stroke-width="2.5"/>
+  <text x="742" y="324" font-size="11.5" font-weight="700" fill="#7f77dd">6 · Verify</text>
+  <text x="742" y="342" font-size="10.5" fill="#6b665d">same workload</text>
+  <text x="742" y="362" font-size="9" fill="#9a958c">no regressions?</text>
+
+  <path d="M210,340 L233,340" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <path d="M375,340 L398,340" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <path d="M540,340 L563,340" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <path d="M705,340 L728,340" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+
+  <path d="M470,380 C470,418 400,418 400,450" stroke="#1d9e75" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="486" y="408" font-size="9" fill="#1d9e75">ground every change</text>
+
+  <rect x="290" y="450" width="180" height="56" rx="9" fill="#f7f5ef" stroke="#1d9e75"/>
+  <text x="304" y="471" font-size="11.5" font-weight="700" fill="#0f6e56">decision-log.md</text>
+  <text x="304" y="488" font-size="10" fill="#6b665d">cached MS Learn grounding</text>
+  <text x="304" y="500" font-size="9" fill="#9a958c">keyed by finding</text>
+
+  <rect x="500" y="450" width="170" height="56" rx="9" fill="#f7f5ef" stroke="#1d9e75"/>
+  <text x="514" y="471" font-size="11.5" font-weight="700" fill="#0f6e56">Microsoft Learn MCP</text>
+  <text x="514" y="488" font-size="10" fill="#6b665d">docs search + fetch</text>
+  <text x="514" y="500" font-size="9" fill="#9a958c">only on cache miss</text>
+
+  <path d="M472,478 L498,478" stroke="#1d9e75" stroke-width="1.5" fill="none" marker-start="url(#ah)" marker-end="url(#ah)"/>
+  <text x="380" y="524" text-anchor="middle" font-size="9.5" fill="#6b665d">grep the cache first · only fetch on a miss · write the result back (gets cheaper each run)</text>
+
+  <path d="M120,422 L120,548" stroke="#8c887e" stroke-width="1.5" fill="none" marker-end="url(#ah)"/>
+  <text x="128" y="500" font-size="9" fill="#9a958c">on termination</text>
+
+  <rect x="110" y="548" width="720" height="74" rx="10" fill="#f7f5ef" stroke="#d8d4ca"/>
+  <rect x="110" y="548" width="4" height="74" rx="2" fill="#7f77dd"/>
+  <text x="128" y="570" font-size="12.5" font-weight="700" fill="#26231d">OUTPUTS · one self-contained folder per run</text>
+  <text x="128" y="591" font-size="11" fill="#6b665d">report.html · winner.sql · changes.sql · run.log · manifest.json · evidence/</text>
+  <text x="128" y="609" font-size="10" fill="#9a958c">every plan XML + IO stat captured at every step is written to disk and linked from the report</text>
+
+  <rect x="250" y="648" width="12" height="12" rx="2" fill="#7f77dd"/>
+  <text x="268" y="658" font-size="10" fill="#6b665d">pipeline (deterministic + one LLM step)</text>
+  <rect x="520" y="648" width="12" height="12" rx="2" fill="#1d9e75"/>
+  <text x="538" y="658" font-size="10" fill="#6b665d">self-learning cache</text>
+  <text x="470" y="682" text-anchor="middle" font-size="10" font-style="italic" fill="#9a958c">Never touches the live proc — every change is a sandbox copy with a diff and a rollback script.</text>
+</svg>
