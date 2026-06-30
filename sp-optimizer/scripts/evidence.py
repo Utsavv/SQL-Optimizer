@@ -179,9 +179,14 @@ class RunDir:
             "",
             "-- Changes that produced this winner (apply in order):",
         ]
+        # A change recorded on iteration N is applied AFTER iteration N is scored
+        # (it produces the sandbox scored in iteration N+1). So the changes that
+        # produced the winning definition are those from iterations strictly
+        # BEFORE best.iteration; including best.iteration's own change would list
+        # a change that is not present in the winning proc_def.
         applied = [
             r.change_applied for r in history
-            if r.iteration <= best.iteration
+            if r.iteration < best.iteration
             and r.change_applied and r.change_applied.kind != "none"
             and r.change_applied.apply_sql.strip()
         ]

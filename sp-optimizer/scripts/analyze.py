@@ -97,9 +97,13 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
     skew_ops = 0
     for rel in _findall(root, "RelOp"):
         est = float(rel.get("EstimateRows", "0") or 0)
-        rt = rel.find(".//sp:RunTimeInformation/sp:RunTimeCountersPerThread", NS)
-        if rt is not None:
-            actual = float(rt.get("ActualRows", "0") or 0)
+        # Each RelOp carries its OWN runtime counters as a direct child; using a
+        # descendant axis (.//) here would let an outer operator pick up a nested
+        # child's counters and compare them against the parent's estimate, so
+        # match only the immediate child (same pattern as capture._attach_runtime).
+        rts = rel.findall("./sp:RunTimeInformation/sp:RunTimeCountersPerThread", NS)
+        if rts:
+            actual = sum(float(rt.get("ActualRows", "0") or 0) for rt in rts)
             if est > 0 and (actual / est > 10 or est / max(actual, 1) > 10):
                 skew_ops += 1
     if skew_ops:
