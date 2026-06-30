@@ -4,6 +4,7 @@ pyodbc>=4.0.39
 # Environment / secrets
 python-dotenv>=1.0.0
 
-# LLM backends (install at least one)
-anthropic>=0.30.0
-google-cloud-aiplatform>=1.50.0
+# LLM backend — provider-agnostic via LiteLLM (OpenAI, Anthropic, Gemini,
+# Azure, Bedrock, etc.); switch providers by changing LLM_MODEL in .env,
+# no code or dependency change needed.
+litellm>=1.40.0

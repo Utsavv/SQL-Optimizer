@@ -20,7 +20,7 @@ except ImportError:
     pass  # python-dotenv not installed; rely on environment variables directly
 
 from . import analyze, capture, discover
-from .llm import ClaudeBackend, FileBackend, GeminiBackend, LLMBackend
+from .llm import FileBackend, LiteLLMBackend, LLMBackend
 from .models import (
     Change,
     IterationResult,
@@ -174,9 +174,12 @@ def main(argv=None):
         default=os.environ.get("SQL_CONNECTION_STRING"),
         help="pyodbc connection string (defaults to SQL_CONNECTION_STRING env var)",
     )
-    ap.add_argument("--backend", choices=["gemini", "claude", "file"], default="gemini")
-    ap.add_argument("--model", default=None)
-    ap.add_argument("--project", default=None, help="GCP project (gemini backend)")
+    ap.add_argument("--backend", choices=["litellm", "file"], default="litellm")
+    ap.add_argument(
+        "--model", default=None,
+        help="LiteLLM model string, e.g. gemini/gemini-1.5-flash, "
+             "claude-3-5-sonnet-20241022, gpt-4o (defaults to LLM_MODEL in .env)",
+    )
     ap.add_argument("--decisions", default=os.environ.get("SP_OPT_DECISIONS"),
                     help="JSON file of pre-decided changes (file backend)")
     ap.add_argument("--max-iterations", type=int, default=5)
@@ -197,14 +200,12 @@ def main(argv=None):
         print("pyodbc is required: pip install pyodbc", file=sys.stderr)
         return 2
 
-    if args.backend == "gemini":
-        backend = GeminiBackend(model=args.model or "gemini-1.5-flash", project=args.project)
-    elif args.backend == "file":
+    if args.backend == "file":
         if not args.decisions:
             ap.error("--decisions <path> is required for --backend file (or set SP_OPT_DECISIONS)")
         backend = FileBackend(args.decisions)
     else:
-        backend = ClaudeBackend(model=args.model or "claude-sonnet-4-6")
+        backend = LiteLLMBackend(model=args.model)
 
     conn = pyodbc.connect(args.conn, autocommit=True)
     cursor = conn.cursor()

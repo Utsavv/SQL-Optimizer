@@ -53,7 +53,7 @@ common levers it exposes:
   (default 80%) and a max iteration count (default 5).
 - **Estimated vs actual** — estimated plans are read-only and the default; ask
   for *actual* runtime stats only against non-prod, since that executes the proc.
-- **Which LLM backend** — Claude, Gemini (Vertex AI), or a replay/file backend.
+- **Which LLM backend** — any provider via [LiteLLM](https://docs.litellm.ai/docs/providers) (OpenAI, Anthropic, Gemini, Azure, Bedrock, ...), or a replay/file backend.
 
 ## How the Python code powers the skill
 
@@ -66,7 +66,7 @@ offline.
 | `scripts/discover.py` | Discover | parameter space → workload combos, **auto-derived from the proc's real data** (`derive_combos_from_data`) | no |
 | `scripts/capture.py` | Capture | execution plan + runtime capture | no |
 | `scripts/analyze.py` | Analyze | deterministic plan-XML scoring | no |
-| `scripts/llm.py` | Decide | propose one safe change as strict JSON; pluggable Claude / Gemini / file backend | **yes** |
+| `scripts/llm.py` | Decide | propose one safe change as strict JSON; pluggable LiteLLM / file backend | **yes** |
 | `scripts/optimize.py` | Apply + Verify | the loop + sandbox management + CLI + report | no |
 
 The skill walks these in order — discover → capture → analyze → decide →
@@ -81,24 +81,58 @@ you want to drive it by hand or in CI:
 python -m scripts.optimize \
   --proc "dbo.usp_GetMemberActivity" \
   --conn "Driver={ODBC Driver 18 for SQL Server};Server=.;Database=Loyalty;Trusted_Connection=yes;Encrypt=yes;TrustServerCertificate=yes" \
-  --backend claude \
+  --backend litellm --model "gemini/gemini-1.5-flash" \
   --max-iterations 5 --target-fraction 0.8 \
   --report out/report.md
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
+# --model defaults to LLM_MODEL (.env) if omitted.
 # Add --actual to capture runtime stats (executes the proc — non-prod only).
 ```
 
 ## Install
 
 ```bash
-pip install pyodbc
-# choose one backend:
-pip install anthropic                           # Claude
-pip install google-cloud-aiplatform vertexai    # Gemini (Vertex AI)
+pip install -r requirements.txt
 ```
 
 Requires ODBC Driver 18 for SQL Server. Works against on-prem SQL Server
 (2016+), Azure SQL MI, and AWS RDS for SQL Server.
+
+### LLM backend (LiteLLM)
+
+The decision step calls the model through [LiteLLM](https://docs.litellm.ai/docs/providers),
+so switching providers is a config change, not a code change: set `LLM_MODEL`
+to a LiteLLM model string in `.env` and put the matching API key alongside it.
+
+```python
+from litellm import completion
+import os
+
+# Set your API key(s) in environment variables (or .env — see .env.example)
+os.environ["GEMINI_API_KEY"] = "your-gemini-key"
+os.environ["OPENAI_API_KEY"] = "your-openai-key"
+os.environ["ANTHROPIC_API_KEY"] = "your-anthropic-key"
+
+messages = [{"content": "Hello, how are you?", "role": "user"}]
+
+# To use Gemini
+response = completion(model="gemini/gemini-1.5-flash", messages=messages)
+
+# To switch provider, you ONLY change the model string:
+response = completion(model="gpt-4o", messages=messages)
+response = completion(model="claude-3-5-sonnet-20241022", messages=messages)
+
+print(response.choices[0].message.content)
+```
+
+| Provider | `LLM_MODEL` example | API key env var |
+|---|---|---|
+| Gemini | `gemini/gemini-1.5-flash` | `GEMINI_API_KEY` |
+| OpenAI | `gpt-4o` | `OPENAI_API_KEY` |
+| Anthropic | `claude-3-5-sonnet-20241022` | `ANTHROPIC_API_KEY` |
+
+`scripts/llm.py`'s `LiteLLMBackend` reads `LLM_MODEL` from `.env` by default,
+or pass `--model` on the CLI to override per run.
 
 ## Why this is different from existing tools
 

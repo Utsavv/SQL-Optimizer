@@ -24,7 +24,8 @@ This skill is **procedure-agnostic** — point it at *any* stored procedure in a
   │ 3. ANALYZE    parse plan XML → score plans, find bottlenecks  │
   │               (scans, spills, sniffing skew, missing indexes) │
   │ 4. DECIDE     LLM proposes targeted changes (hints, OPTION,   │
-  │               index, rewrite). Stop if already good enough.   │
+  │               index, rewrite), grounded in cached or fresh    │
+  │               Microsoft Learn guidance. Stop if good enough.  │
   │ 5. APPLY      apply change to a sandbox copy of the SP        │
   │ 6. VERIFY     re-capture plans across the SAME workload       │
   │               → did the majority improve without regressions? │
@@ -64,11 +65,12 @@ The same flow applies to every proc — substitute the name and connection; noth
 ```bash
 python -m scripts.optimize \
   --proc "<schema>.<your_proc>" \
-  --backend claude \
+  --backend litellm --model "gemini/gemini-1.5-flash" \
   --max-iterations 5 \
   --target-fraction 0.8 \
   --report out/report.md
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
+# --model defaults to LLM_MODEL (.env) if omitted.
 # add --actual to capture runtime stats (executes the proc — non-prod only).
 ```
 
@@ -77,11 +79,35 @@ Walk through the modules in this order when reading or extending the code:
 2. `scripts/capture.py` — execution plan + runtime capture
 3. `scripts/analyze.py` — plan XML scoring (see `references/plan-analysis.md`)
 4. `scripts/optimize.py` — the orchestration loop + LLM decision step
-5. `scripts/llm.py` — pluggable LLM backend (Gemini, Claude, or replay); the decision prompt encodes the index discipline from `references/indexing-best-practices.md`
+5. `scripts/llm.py` — pluggable LLM backend (any provider via LiteLLM, or replay); the decision prompt encodes the index discipline from `references/indexing-best-practices.md`
+
+## Decision grounding (Microsoft Learn MCP, cached)
+
+When the decision step (step 4) is driven by an interactive agent (e.g. via
+`--backend file` with Microsoft Learn MCP available — see `FileBackend` in
+`scripts/llm.py`), ground every proposed change in official guidance, but
+**check the cache before paying for a fresh lookup**:
+
+1. **Read `references/decision-log.md` first.** Match the current finding
+   (warning type, signal, or proposed change `kind`) against each entry's
+   `Keywords:` line.
+2. **Cache hit** — an entry already answers the question: use its
+   `Takeaway:` to make the decision and cite its `Source:` URL(s) in the
+   rationale. Do not call Microsoft Learn MCP.
+3. **Cache miss** — no entry covers it, or the scenario meaningfully differs
+   (different warning type, version, or conflicting signal): call
+   `microsoft_docs_search` (and `microsoft_docs_fetch` if needed), make the
+   decision, then **append a new entry** to `references/decision-log.md` in
+   the format documented at the top of that file so future runs hit the
+   cache instead of re-querying.
+
+This keeps token spend on MCP search/fetch calls limited to genuinely new
+questions instead of re-researching the same parameter-sniffing or
+indexing patterns on every run.
 
 ## LLM backend
 
-The decision step (step 4) is the only place an LLM is required. It is pluggable: `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with three implementations — `GeminiBackend` (Vertex AI), `ClaudeBackend`, and `FileBackend` (`--backend file --decisions <path>`), which replays agent-made decisions from JSON when no model API key is available. The analysis and capture steps are deterministic and need no model.
+The decision step (step 4) is the only place an LLM is required. It is pluggable: `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with two implementations — `LiteLLMBackend` (default; routes to any provider — OpenAI, Anthropic, Gemini, Azure, Bedrock, etc. — via the `LLM_MODEL` env var / `--model` flag and the matching API key, no code change needed to switch) and `FileBackend` (`--backend file --decisions <path>`), which replays agent-made decisions from JSON when no model API key is available. The analysis and capture steps are deterministic and need no model.
 
 The structured JSON prompt that drives the decision step lives in `scripts/llm.py` (`SYSTEM_PROMPT`) — it asks for a single, smallest-safe change plus rationale and a rollback, returned as strict JSON. None of it references any specific procedure, so it applies unchanged to whatever proc you target.
 
@@ -101,3 +127,4 @@ A run produces:
 - New plan-analysis rules go in `scripts/analyze.py` and are documented in `references/plan-analysis.md`.
 - To add a parameter-value strategy (e.g. pull real distributions from Query Store or a stats histogram, or map more predicate shapes), extend `scripts/discover.py` — `derive_combos_from_data()` is the data-anchored generator that keeps the workload generic across procs.
 - Indexing guidance the LLM must follow when proposing an index lives in `references/indexing-best-practices.md`; keep the `SYSTEM_PROMPT` in `scripts/llm.py` in sync with it.
+- Every Microsoft Learn MCP lookup made during a decision step should leave a new entry in `references/decision-log.md` (format documented at the top of that file) so the next run can reuse it instead of re-querying.

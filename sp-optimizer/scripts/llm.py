@@ -2,7 +2,9 @@
 
 The ONLY place a model is required. Given the current procedure text and the
 analyzed workload, the model proposes a single smallest-safe change as strict
-JSON. Two interchangeable backends are provided: Gemini (Vertex AI) and Claude.
+JSON. The default backend goes through LiteLLM, so the provider (OpenAI,
+Anthropic, Gemini, Azure, Bedrock, ...) is just a model-string + API-key
+choice — no code change needed to switch.
 
 The prompt deliberately constrains the model to ONE change per iteration with a
 rollback, so the loop stays auditable and reversible.
@@ -10,6 +12,7 @@ rollback, so the loop stays auditable and reversible.
 from __future__ import annotations
 
 import json
+import os
 from typing import Optional, Protocol
 
 from .models import Change, PlanScore
@@ -89,26 +92,33 @@ class LLMBackend(Protocol):
     def propose_change(self, proc_text: str, scores: list[PlanScore]) -> Change: ...
 
 
-class GeminiBackend:
-    """Vertex AI Gemini backend — matches the user's existing stack."""
+class LiteLLMBackend:
+    """Provider-agnostic backend, routed through LiteLLM.
 
-    def __init__(self, model: str = "gemini-1.5-flash", project: Optional[str] = None,
-                 location: str = "us-central1"):
-        self.model_name = model
-        self.project = project
-        self.location = location
+    The provider is selected entirely by the ``model`` string (e.g.
+    ``"gemini/gemini-1.5-flash"``, ``"claude-3-5-sonnet-20241022"``,
+    ``"gpt-4o"``) and the matching API key in the environment — no code
+    change is needed to switch providers. See README.md for the model-string
+    / env-var mapping for each provider.
+    """
+
+    def __init__(self, model: Optional[str] = None, temperature: float = 0.2):
+        self.model_name = model or os.environ.get("LLM_MODEL", "gemini/gemini-1.5-flash")
+        self.temperature = temperature
 
     def propose_change(self, proc_text: str, scores: list[PlanScore]) -> Change:
-        import vertexai
-        from vertexai.generative_models import GenerativeModel
+        from litellm import completion
 
-        vertexai.init(project=self.project, location=self.location)
-        model = GenerativeModel(self.model_name, system_instruction=SYSTEM_PROMPT)
-        resp = model.generate_content(
-            build_user_prompt(proc_text, scores),
-            generation_config={"temperature": 0.2, "response_mime_type": "application/json"},
+        resp = completion(
+            model=self.model_name,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": build_user_prompt(proc_text, scores)},
+            ],
+            temperature=self.temperature,
         )
-        return _parse_change(resp.text)
+        text = resp.choices[0].message.content
+        return _parse_change(text)
 
 
 class FileBackend:
@@ -116,8 +126,8 @@ class FileBackend:
 
     Used when the decision step is made by an external agent (e.g. Claude Code
     driving Microsoft Learn doc lookups) rather than an in-process API call —
-    no ANTHROPIC_API_KEY required. The file is a JSON array of change objects in
-    the same shape ClaudeBackend would emit; each call to ``propose_change``
+    no LLM API key required. The file is a JSON array of change objects in
+    the same shape LiteLLMBackend would emit; each call to ``propose_change``
     returns the next one. When the list is exhausted it returns ``kind="none"``
     so the loop terminates cleanly.
     """
@@ -140,23 +150,3 @@ class FileBackend:
             rollback_sql=data.get("rollback_sql", ""),
             target_object=data.get("target_object", ""),
         )
-
-
-class ClaudeBackend:
-    """Anthropic Claude backend."""
-
-    def __init__(self, model: str = "claude-sonnet-4-6"):
-        self.model_name = model
-
-    def propose_change(self, proc_text: str, scores: list[PlanScore]) -> Change:
-        import anthropic
-
-        client = anthropic.Anthropic()
-        resp = client.messages.create(
-            model=self.model_name,
-            max_tokens=2000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": build_user_prompt(proc_text, scores)}],
-        )
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        return _parse_change(text)
