@@ -17,8 +17,9 @@ This skill is **procedure-agnostic** — point it at *any* stored procedure in a
 
 ```
   ┌─────────────────────────────────────────────────────────────┐
-  │ 1. DISCOVER   parse SP signature → generate representative    │
-  │               parameter value combinations (the "workload")  │
+  │ 1. DISCOVER   parse SP signature → explore the tables it      │
+  │               filters for real values + enumerate optional-   │
+  │               param NULL combinations (the "workload")        │
   │ 2. CAPTURE    for each combo, get the estimated + actual      │
   │               execution plan and runtime stats                │
   │ 3. ANALYZE    parse plan XML → score plans, find bottlenecks  │
@@ -56,7 +57,7 @@ The same flow applies to every proc — substitute the name and connection; noth
 
 1. **Name the target.** Any schema-qualified proc: `--proc "<schema>.<proc>"`. No allow-list, no per-proc setup.
 2. **Connect.** Pass `--conn` or set `SQL_CONNECTION_STRING` in `.env`; the CLI reads it automatically.
-3. **Let the workload be derived.** `discover.py` reads the signature from `sys.parameters`, then builds the workload **from the proc's own data**: it maps each parameter to the column it filters, reads that column's real min/max, and fans out narrow → medium → wide → empty windows (the spread that exposes parameter-sniffing skew). No hand-written combos are needed for the common date-range case. You can still override with a curated `SP_OPT_COMBOS` file when you want exact values.
+3. **Let the workload be derived.** `discover.py` reads the signature from `sys.parameters`, then builds the workload **from the proc's own data**: it maps each parameter to the column it filters and mines that column's real contents. Datetime range/bound params fan out narrow → medium → wide → empty windows (the spread that exposes parameter-sniffing skew); equality/other params are exercised with real frequency-ranked values (a hot common value and a selective rare one) that actually exist in the table. On top of that, **optional / catch-all params** (declared with a default, or guarded by `@p IS NULL OR …` / `ISNULL` / `COALESCE`) are enumerated on the NULL-vs-supplied axis, so every combination of "which optional filters are active" — each a potentially different plan — is captured. No hand-written combos are needed; you can still override with a curated `SP_OPT_COMBOS` file when you want exact values, and raise `--max-combos` when a proc has many optional params.
 4. **Run the loop.** Capture → analyze → decide → apply-to-sandbox → re-verify, until a termination condition is met.
 5. **Review outputs** under the run's output dir: the report, the applied changes + rollbacks, and the winning variant.
 

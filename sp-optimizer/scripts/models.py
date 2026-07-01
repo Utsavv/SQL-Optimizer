@@ -12,6 +12,11 @@ class ProcParam:
     sql_type: str             # e.g. "int", "varchar(50)", "datetime2"
     is_output: bool = False
     default: Optional[str] = None
+    # True when the parameter declares a default (``@p ... = NULL``). Optional
+    # params are the ones callers routinely omit, so their NULL branch is a
+    # real, high-traffic path the workload must exercise. Set from
+    # sys.parameters.has_default_value during discovery.
+    has_default: bool = False
 
 
 @dataclass
