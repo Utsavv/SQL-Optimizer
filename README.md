@@ -18,6 +18,7 @@ of arguments performs badly for others.
 |---|---|
 | `sp-optimizer/` | The optimizer itself: `SKILL.md` (the skill definition), `scripts/` (the Python engine), `references/` (grounding docs used at the decision step), `examples/worldwideimporters/` (one worked run, including `RUN-LOG.md`), `out/` (per-run output, git-ignored) |
 | `.claude/skills/sp-optimizer` | Symlink into `sp-optimizer/` so Claude Code auto-discovers the skill from this repo |
+| `workload-drivers/` | Headless load generators that put a heavy concurrent OLTP workload on WideWorldImporters (order-entry and vehicle-location inserts), so you can assess stored-procedure performance *under load*. Cross-platform Python ports of Microsoft's `wide-world-importers/workload-drivers` sample |
 | `setup/` | One-time environment bootstrap scripts — provision/load a test database, verify connectivity, roll back an optimizer run. Not needed if you already have a SQL Server to point the optimizer at |
 | `setup/deploy_wwi_free.sh` | Provisions a **new** Azure SQL Database (free tier) and loads the WorldWideImporters sample DB into it |
 | `setup/deploy_wwi_existing.sh` | Loads WorldWideImporters into an **existing** Azure SQL Server via `sqlpackage` |
