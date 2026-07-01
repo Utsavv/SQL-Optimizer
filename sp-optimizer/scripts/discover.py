@@ -4,11 +4,20 @@ Strategy (in priority order):
   1. Read the proc signature from sys.parameters to learn names/types.
   2. If SP_OPT_COMBOS points at a JSON file, use those combos verbatim (lets a
      caller inject a fully hand-curated workload for any proc).
-  3. Otherwise, DERIVE a realistic workload from the proc's *own* data: map each
-     parameter to the table column it filters, read that column's real range
-     from the database, and build narrow -> wide -> empty windows around it.
-     This is what makes the skill generic across procedures — the workload is
-     computed from whatever proc you point it at, not hand-written per proc.
+  3. Otherwise, DERIVE a realistic workload from the proc's *own* data. For each
+     parameter, map it to the table column it filters and mine that column's
+     actual contents:
+       - datetime range/bound filters -> real min/max, fanned into narrow ->
+         wide -> empty windows (the classic sniffing spread).
+       - equality/other filters -> real frequency-ranked values (a hot common
+         value AND a selective rare one), so the proc is exercised with argument
+         values that actually exist in the data instead of invented constants.
+     On top of that, any OPTIONAL / catch-all parameter (declared with a default,
+     or guarded by ``@p IS NULL OR ...`` / ISNULL / COALESCE) is enumerated on
+     the NULL vs. real-value axis, so every combination of "which optional
+     filters are supplied" is represented — each combination can compile to a
+     very different plan. This is what makes the skill generic across procedures:
+     the workload is computed from whatever proc you point it at.
   4. As a final fallback (no DB introspection possible), synthesize boundary +
      typical values per type so a workload always exists.
 
@@ -22,7 +31,7 @@ import json
 import os
 import re
 from datetime import datetime, timedelta
-from itertools import product
+from itertools import combinations, product
 from typing import Optional
 
 from .models import ParamCombo, ProcParam
@@ -51,10 +60,12 @@ def _combos_from_env() -> Optional[list[ParamCombo]]:
 # ---- 1. signature -----------------------------------------------------------
 
 SIGNATURE_SQL = """
-SELECT p.name        AS param_name,
-       t.name        AS type_name,
-       p.max_length  AS max_length,
-       p.is_output   AS is_output
+SELECT p.name              AS param_name,
+       t.name              AS type_name,
+       p.max_length        AS max_length,
+       p.is_output         AS is_output,
+       p.has_default_value AS has_default,
+       p.default_value     AS default_value
 FROM sys.parameters p
 JOIN sys.types t ON p.user_type_id = t.user_type_id
 WHERE p.object_id = OBJECT_ID(?)
@@ -69,11 +80,15 @@ def get_signature(cursor, proc_name: str) -> list[ProcParam]:
         type_disp = row.type_name
         if row.type_name in ("varchar", "nvarchar", "char", "nchar"):
             type_disp = f"{row.type_name}({row.max_length})"
+        has_default = bool(getattr(row, "has_default", False))
+        default_val = getattr(row, "default_value", None)
         params.append(
             ProcParam(
                 name=row.param_name,
                 sql_type=type_disp,
                 is_output=bool(row.is_output),
+                has_default=has_default,
+                default=None if default_val is None else str(default_val),
             )
         )
     return params
@@ -209,11 +224,81 @@ def _column_min_max(cursor, table: str, column: str) -> Optional[tuple]:
     return None
 
 
+def _sample_column_values(cursor, table: str, column: str) -> tuple[object, object]:
+    """Return (most_common_value, rare_value) that actually occur in a column.
+
+    The two ends of the frequency distribution are the values worth testing: the
+    hot value the proc is most often called with (large result → the plan the
+    optimizer should be good at) and a selective rare value (small result → the
+    plan that benefits from a seek). Both are *real* — pulled from the data — so
+    an equality predicate like ``col = @p`` is never exercised with an invented
+    constant that returns nothing. Returns (None, None) on any error / empty
+    column so callers degrade to synthesis.
+    """
+    try:
+        cursor.execute(
+            f"SELECT TOP (1) [{column}] AS v FROM {table} "
+            f"WHERE [{column}] IS NOT NULL "
+            f"GROUP BY [{column}] ORDER BY COUNT_BIG(*) DESC;"
+        )
+        row = cursor.fetchone()
+        common = row.v if row else None
+        cursor.execute(
+            f"SELECT TOP (1) [{column}] AS v FROM {table} "
+            f"WHERE [{column}] IS NOT NULL "
+            f"GROUP BY [{column}] ORDER BY COUNT_BIG(*) ASC;"
+        )
+        row = cursor.fetchone()
+        rare = row.v if row else None
+        return common, rare
+    except Exception:
+        return None, None
+
+
+# Constructs that mark a parameter as OPTIONAL / catch-all, i.e. one whose NULL
+# branch short-circuits its filter. Each of these compiled with the param NULL
+# vs. supplied can produce a wildly different plan, so both must be exercised.
+def _nullable_params(inputs: list[ProcParam], proc_text: str) -> set[str]:
+    """Names of params that behave as optional filters (a real NULL branch).
+
+    A param counts as nullable/optional when EITHER it declares a default (the
+    caller can omit it), OR the body guards it with the catch-all idioms
+    ``@p IS NULL`` / ``ISNULL(@p, ...)`` / ``COALESCE(@p, ...)``. Those are the
+    params whose NULL vs. supplied combinations we fan out over.
+    """
+    nullable: set[str] = set()
+    text = proc_text or ""
+    for p in inputs:
+        esc = re.escape(p.name)
+        if p.has_default:
+            nullable.add(p.name)
+            continue
+        if re.search(esc + r"\s+IS\s+NULL", text, re.IGNORECASE):
+            nullable.add(p.name)
+        elif re.search(r"\bISNULL\s*\(\s*" + esc + r"\b", text, re.IGNORECASE):
+            nullable.add(p.name)
+        elif re.search(r"\bCOALESCE\s*\([^)]*" + esc + r"\b", text, re.IGNORECASE):
+            nullable.add(p.name)
+    return nullable
+
+
 def _fmt_dt(value) -> str:
     """Format a datetime-ish value as an ISO string the EXEC builder can quote."""
     if isinstance(value, datetime):
         return value.strftime("%Y-%m-%d %H:%M:%S")
     return str(value)
+
+
+def _coerce_value(value) -> object:
+    """Make a DB-sampled value safe for the EXEC arg builder.
+
+    Datetimes are stringified (so they get quoted); everything else (ints,
+    Decimals, bits, strings) passes through unchanged and the builder renders it
+    correctly by type.
+    """
+    if isinstance(value, datetime):
+        return _fmt_dt(value)
+    return value
 
 
 def _datetime_range_windows(lo, hi) -> list[tuple[object, object, str, float]]:
@@ -242,77 +327,52 @@ def _datetime_range_windows(lo, hi) -> list[tuple[object, object, str, float]]:
     return windows
 
 
-def derive_combos_from_data(
+def _datetime_windows_for(
     cursor,
-    params: list[ProcParam],
-    proc_text: str,
-    max_combos: int = 12,
-) -> Optional[list[ParamCombo]]:
-    """Derive a data-anchored workload for any proc, or None if not possible.
+    inputs: list[ProcParam],
+    mapped: dict[str, tuple[str, str, str]],
+) -> list[tuple[dict[str, object], str, float]]:
+    """Build the datetime axis: a list of (assignment, label, weight).
 
-    Currently specialises in the dominant sniffing case — datetime range/bound
-    filters — because date ranges are the most common trigger. Any non-datetime
-    input params are pinned to a single representative value so the datetime
-    window stays the axis of variation. Returns None (caller falls back to
-    synthesis) when no datetime param maps to a readable column.
+    Each assignment sets only the datetime param(s) — the caller merges it with
+    the rest of the parameter values. Handles the two dominant shapes: a coupled
+    lower/upper range pair on one column, and a single datetime bound. Returns []
+    when no datetime param maps to a readable column (there is simply no date
+    axis to vary).
     """
-    inputs = [p for p in params if not p.is_output]
-    if not inputs or not proc_text:
-        return None
-
-    aliases = _resolve_aliases(proc_text)
-    dt_inputs = [p for p in inputs if _is_datetime(p)]
+    dt_inputs = [p for p in inputs if _is_datetime(p) and p.name in mapped]
     if not dt_inputs:
-        return None
-
-    # Map each datetime param to (table, column, op).
-    mapped: dict[str, tuple[str, str, str]] = {}
-    for p in dt_inputs:
-        info = _column_for_param(proc_text, p.name, aliases)
-        if info:
-            mapped[p.name] = info
-    if not mapped:
-        return None
+        return []
+    dmapped = {p.name: mapped[p.name] for p in dt_inputs}
 
     # Detect a lower/upper range pair sharing the same table+column.
-    lowers = {n: i for n, i in mapped.items() if i[2] in (">", ">=")}
-    uppers = {n: i for n, i in mapped.items() if i[2] in ("<", "<=")}
+    lowers = {n: i for n, i in dmapped.items() if i[2] in (">", ">=")}
+    uppers = {n: i for n, i in dmapped.items() if i[2] in ("<", "<=")}
     range_pair = None
     for ln, li in lowers.items():
         for un, ui in uppers.items():
             if ln != un and (li[0], li[1]) == (ui[0], ui[1]):
-                range_pair = (ln, un, li[0], li[1])  # lower_param, upper_param, table, col
+                range_pair = (ln, un, li[0], li[1])  # lower, upper, table, col
                 break
         if range_pair:
             break
 
-    # Pin any non-datetime input params to one representative value.
-    base_values: dict[str, object] = {}
-    for p in inputs:
-        if not _is_datetime(p):
-            vals = _synth_values(p)
-            base_values[p.name] = vals[0] if vals else None
-
-    combos: list[ParamCombo] = []
+    out: list[tuple[dict[str, object], str, float]] = []
     if range_pair:
         lparam, uparam, table, col = range_pair
         rng = _column_min_max(cursor, table, col)
         if not rng:
-            return None
+            return []
         lo, hi = rng
         for lower, upper, label, weight in _datetime_range_windows(lo, hi):
-            values = dict(base_values)
-            values[lparam] = _fmt_dt(lower)
-            values[uparam] = _fmt_dt(upper)
-            combos.append(ParamCombo(values=values, label=label, weight=weight))
+            out.append(({lparam: _fmt_dt(lower), uparam: _fmt_dt(upper)}, label, weight))
     else:
         # Single datetime bound (e.g. col >= @FromDate): vary that one param.
-        pname, (table, col, _op) = next(iter(mapped.items()))
+        pname, (table, col, _op) = next(iter(dmapped.items()))
         rng = _column_min_max(cursor, table, col)
         if not rng:
-            return None
+            return []
         lo, hi = rng
-        anchors: list[tuple[object, str, float]] = []
         if isinstance(hi, datetime):
             for days, label, weight in (
                 (1, "narrow: last 1 day", 3.0),
@@ -321,17 +381,163 @@ def derive_combos_from_data(
             ):
                 start = hi - timedelta(days=days)
                 if start > lo:
-                    anchors.append((start, label, weight))
-            anchors.append((lo, "wide: full history", 1.0))
-            anchors.append((hi + timedelta(hours=1), "edge: future/empty", 1.0))
+                    out.append(({pname: _fmt_dt(start)}, label, weight))
+            out.append(({pname: _fmt_dt(lo)}, "wide: full history", 1.0))
+            out.append(({pname: _fmt_dt(hi + timedelta(hours=1))}, "edge: future/empty", 1.0))
         else:
-            anchors = [(lo, "min", 1.0), (hi, "max", 1.0)]
-        for anchor, label, weight in anchors:
-            values = dict(base_values)
-            values[pname] = _fmt_dt(anchor)
-            combos.append(ParamCombo(values=values, label=label, weight=weight))
+            out.append(({pname: _fmt_dt(lo)}, "min", 1.0))
+            out.append(({pname: _fmt_dt(hi)}, "max", 1.0))
+    return out
 
-    return combos[:max_combos] if combos else None
+
+def derive_combos_from_data(
+    cursor,
+    params: list[ProcParam],
+    proc_text: str,
+    max_combos: int = 12,
+) -> Optional[list[ParamCombo]]:
+    """Derive a data-anchored workload for any proc, or None if not possible.
+
+    Two axes of variation, both mined from the proc's own tables:
+
+    1. **Datetime windows** — the classic sniffing spread (narrow → wide → empty)
+       built from a date column's real min/max.
+    2. **Optional-parameter NULL combinations** — for every catch-all / optional
+       param, both its NULL branch and a real supplied value are exercised, and
+       the *combinations* across those params are enumerated (each combination
+       is a different set of active filters → potentially a different plan).
+
+    Non-nullable equality params are pinned to a real, frequently-occurring
+    value (with a selective rare value tried as an extra variant). Returns None —
+    so the caller falls back to type-based synthesis — only when nothing about
+    the proc can be anchored to real data (no mappable column, no optional param).
+    """
+    inputs = [p for p in params if not p.is_output]
+    if not inputs or not proc_text:
+        return None
+
+    aliases = _resolve_aliases(proc_text)
+
+    # Map every input param -> (table, column, op), best effort, any type/op.
+    mapped: dict[str, tuple[str, str, str]] = {}
+    for p in inputs:
+        info = _column_for_param(proc_text, p.name, aliases)
+        if info:
+            mapped[p.name] = info
+
+    nullable = _nullable_params(inputs, proc_text)
+
+    # Nothing to anchor to real data and no optional axis to explore → let the
+    # type-based synthesizer take over.
+    if not mapped and not nullable:
+        return None
+
+    by_name = {p.name: p for p in inputs}
+
+    # Real representative value per param. Datetime params vary via the window
+    # sweep, so they are excluded here; every other param gets a hot common value
+    # (typical) and, when available, a selective rare value.
+    typical: dict[str, object] = {}
+    selective: dict[str, object] = {}
+    for p in inputs:
+        if _is_datetime(p):
+            continue
+        common = rare = None
+        if p.name in mapped:
+            table, col, _op = mapped[p.name]
+            common, rare = _sample_column_values(cursor, table, col)
+        if common is None:
+            syn = _synth_values(p)
+            common = syn[0] if syn else None
+        typical[p.name] = _coerce_value(common)
+        if rare is not None:
+            selective[p.name] = _coerce_value(rare)
+
+    dt_windows = _datetime_windows_for(cursor, inputs, mapped)
+
+    # Any datetime param NOT covered by the window sweep still needs a value so
+    # the EXEC call is complete; fall back to a synth constant for it.
+    covered_dt: set[str] = set()
+    for assign, _, _ in dt_windows:
+        covered_dt |= set(assign)
+    for p in inputs:
+        if _is_datetime(p) and p.name not in covered_dt and p.name not in typical:
+            syn = _synth_values(p)
+            typical[p.name] = syn[0] if syn else None
+
+    def base_assignment() -> dict[str, object]:
+        return dict(typical)
+
+    # A representative mid window to hold the date axis fixed while NULL combos
+    # vary the optional filters (so the two axes don't multiply out of control).
+    dt_mid = dt_windows[len(dt_windows) // 2][0] if dt_windows else {}
+
+    # --- assemble combos in priority order --------------------------------
+    # Ordered so the highest-signal combos survive the max_combos cap:
+    #   baseline (all real) → each optional param NULL on its own →
+    #   the rest of the date sweep → multi-param NULL combinations →
+    #   selective rare-value variants.
+    baseline: list[ParamCombo] = []
+    single_null: list[ParamCombo] = []
+    date_sweep: list[ParamCombo] = []
+    multi_null: list[ParamCombo] = []
+    selective_combos: list[ParamCombo] = []
+
+    if dt_windows:
+        first_assign, first_label, first_weight = dt_windows[0]
+        vals = base_assignment()
+        vals.update(first_assign)
+        baseline.append(ParamCombo(values=vals, label=first_label, weight=first_weight))
+        for assign, label, weight in dt_windows[1:]:
+            vals = base_assignment()
+            vals.update(assign)
+            date_sweep.append(ParamCombo(values=vals, label=label, weight=weight))
+    else:
+        baseline.append(
+            ParamCombo(values=base_assignment(), label="typical: real common values", weight=2.0)
+        )
+
+    # Preserve signature order (nullable is a set) so combo labels and the
+    # order combos are generated in are stable run-to-run.
+    nullable_list = [p.name for p in inputs if p.name in nullable]
+    for r in range(1, len(nullable_list) + 1):
+        for subset in combinations(nullable_list, r):
+            vals = base_assignment()
+            vals.update(dt_mid)
+            for n in subset:
+                vals[n] = None
+            names = ", ".join(subset)
+            combo = ParamCombo(
+                values=vals,
+                label=f"optional NULL: {names}",
+                weight=1.5 if r == 1 else 1.0,
+            )
+            (single_null if r == 1 else multi_null).append(combo)
+
+    for name, rare in selective.items():
+        vals = base_assignment()
+        if dt_windows:
+            vals.update(dt_windows[0][0])
+        vals[name] = rare
+        selective_combos.append(
+            ParamCombo(values=vals, label=f"selective: {name}=rare value", weight=1.0)
+        )
+
+    ordered = baseline + single_null + date_sweep + multi_null + selective_combos
+
+    # De-dup on the concrete value set (different axes can collide, e.g. an
+    # optional param already NULL in the baseline) and cap the total.
+    out: list[ParamCombo] = []
+    seen: set[tuple] = set()
+    for combo in ordered:
+        key = tuple(sorted((k, str(v)) for k, v in combo.values.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(combo)
+        if len(out) >= max_combos:
+            break
+    return out or None
 
 
 # ---- 3. synthesize values per type -----------------------------------------
