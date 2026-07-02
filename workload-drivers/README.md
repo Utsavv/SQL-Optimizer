@@ -26,6 +26,8 @@ and CI.
 | `order_insert.py` | `order-insert/` | N threads continuously insert customer orders, generating an intensive order-entry OLTP load | `Website.InsertCustomerOrders` |
 | `vehicle_location.py` | `vehicle-location-insert/` | N threads insert vehicle-location rows, comparing disk-based vs memory-optimized (natively compiled) inserts | `OnDisk.InsertVehicleLocation` / `InMemory.InsertVehicleLocation` |
 | `VehicleLocation.sql` | (vendored verbatim) | Creates the `OnDisk` / `InMemory` schemas, tables, and procedures the vehicle driver needs | — |
+| `xe_capture.sql` | — | Extended Events session template that records every real call (statement + timestamp) of a chosen proc into a ring buffer | any proc |
+| `capture_replay.py` | — | `capture`: harvest the XE ring buffer into a JSONL of real calls · `replay`: re-issue them at original/accelerated pace across N threads (**non-prod only**) | any proc |
 | `common.py` | — | Shared helpers: connection-string resolution, pyodbc connect, thread-safe running stats | — |
 
 ## Prerequisites
@@ -114,6 +116,35 @@ Options: `--threads` (default 4), `--rows-per-thread` (default 50000), `--mode`
 > ```
 > Only do this on a non-production database — it trades a small durability
 > window for throughput.
+
+## Capture/replay workload (real production calls)
+
+The synthetic drivers above generate *shaped* load; the most realistic load is
+the load you actually had. `xe_capture.sql` + `capture_replay.py` record and
+re-issue a procedure's **real calls**:
+
+1. Edit the `WHERE ... like_i_sql_unicode_string([statement], N'%YourProc%')`
+   filter in `xe_capture.sql`, run it against the source database, and let real
+   traffic flow for a representative window. The session is database-scoped
+   (works on Azure SQL DB) with a bounded ring buffer and
+   `ALLOW_SINGLE_EVENT_LOSS`, so overhead stays low.
+2. Harvest the captured calls (before the ring buffer wraps):
+   ```bash
+   python workload-drivers/capture_replay.py capture --out calls.jsonl
+   ```
+3. Replay them against a **test copy** of the database — original pacing,
+   accelerated, or flat-out:
+   ```bash
+   python workload-drivers/capture_replay.py replay --calls calls.jsonl --threads 8            # 1x
+   python workload-drivers/capture_replay.py replay --calls calls.jsonl --speed 10             # 10x
+   python workload-drivers/capture_replay.py replay --calls calls.jsonl --speed 0 --threads 16 # max
+   ```
+
+Replay executes the captured statements verbatim — non-production targets
+only. Run it while `sp-optimizer`'s `scripts/simulate.py` A/B-tests a winner
+variant to validate a change under the exact traffic that motivated it.
+(Distributed Replay was deprecated in SQL Server 2022; this is the small,
+proc-focused replacement for this repo's workflow.)
 
 ## Attribution
 

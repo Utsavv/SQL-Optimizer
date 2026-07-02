@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .models import Change, IterationResult, PlanCapture, PlanScore
+from .models import Change, IterationResult, PlanCapture, PlanScore, ReviewFinding
 
 
 def _slug(text: str, fallback: str = "item") -> str:
@@ -63,7 +63,11 @@ class RunDir:
         self.changes_path = self.root / "changes.sql"
         self.winner_path = self.root / "winner.sql"
         self.manifest_path = self.root / "manifest.json"
+        self.review_path = self.root / "review.json"
         self.log_path = self.root / "run.log"
+        # Findings from the static T-SQL review step, stashed here by
+        # write_review so the report renderer can include them.
+        self.review_findings: list[ReviewFinding] = []
         self._log_fh = open(self.log_path, "a", encoding="utf-8")
         self.log(f"run start · proc={proc_name} · dir={self.root}")
 
@@ -120,6 +124,7 @@ class RunDir:
                     "cpu_ms": score.cpu_ms,
                     "logical_reads": score.logical_reads,
                     "output_rows": score.output_rows,
+                    "top_waits_ms": cap.wait_stats,
                 },
                 "evidence": {"plan": plan_rel, "statistics": stats_rel},
             }
@@ -128,6 +133,21 @@ class RunDir:
             )
 
         return plan_rel, stats_rel
+
+    # ---- static review findings ----------------------------------------------
+
+    def write_review(self, findings: list[ReviewFinding]) -> None:
+        """Persist the static T-SQL review findings for the run (review.json)
+        and keep them on the RunDir for the report renderer."""
+        self.review_findings = list(findings)
+        payload = [
+            {"rule": f.rule, "severity": f.severity,
+             "message": f.message, "snippet": f.snippet}
+            for f in findings
+        ]
+        self.review_path.write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
 
     # ---- end-of-run artifacts ----------------------------------------------
 
@@ -147,11 +167,16 @@ class RunDir:
             if not c or c.kind == "none" or not c.apply_sql.strip():
                 continue
             any_change = True
+            status = (
+                " (ROLLED BACK during the run — no longer on the database)"
+                if r.change_rolled_back else ""
+            )
             lines += [
-                f"-- ===== Iteration {r.iteration}: {c.kind} {c.target_object} =====",
+                f"-- ===== Iteration {r.iteration}: {c.kind} {c.target_object}{status} =====",
                 f"-- {c.rationale}",
                 "",
-                c.apply_sql.strip(),
+                c.apply_sql.strip() if not r.change_rolled_back
+                else _comment_block(c.apply_sql.strip()),
                 "",
                 "-- Rollback:",
                 _comment_block(c.rollback_sql.strip()),
@@ -166,7 +191,10 @@ class RunDir:
         it. Returns the winning IterationResult (or None if there's no history)."""
         if not history:
             return None
-        best = max(history, key=lambda r: r.aggregate_score)
+        # A variant produced by a rolled-back change failed the no-regression
+        # contract — it can never be the winner even if its aggregate is highest.
+        candidates = [r for r in history if not r.variant_invalidated] or history
+        best = max(candidates, key=lambda r: r.aggregate_score)
         baseline = history[0]
         header = [
             f"-- Winning variant for {self.proc_name}",
@@ -189,6 +217,7 @@ class RunDir:
             if r.iteration < best.iteration
             and r.change_applied and r.change_applied.kind != "none"
             and r.change_applied.apply_sql.strip()
+            and not r.change_rolled_back
         ]
         if applied:
             for c in applied:
@@ -223,6 +252,8 @@ class RunDir:
                 "fraction_good": round(r.fraction_good, 4),
                 "scored_proc": r.scored_proc,
                 "change_applied": _change_dict(r.change_applied),
+                "change_rolled_back": r.change_rolled_back,
+                "variant_invalidated": r.variant_invalidated,
                 "regressions": r.regressions,
                 "combos": combos,
             })
@@ -235,6 +266,7 @@ class RunDir:
                 "run_log": self.log_path.name,
                 "changes": self.changes_path.name,
                 "winner": self.winner_path.name,
+                "review": self.review_path.name if self.review_path.exists() else None,
             },
             "iterations": iterations,
         }

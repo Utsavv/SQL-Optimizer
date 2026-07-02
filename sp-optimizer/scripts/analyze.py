@@ -17,6 +17,10 @@ from .models import PlanCapture, PlanScore
 # Physical operators that read an entire input (vs. a seek into a subset).
 _FULL_SCAN_OPS = {"Table Scan", "Clustered Index Scan", "Index Scan"}
 
+# Spool operators: the plan is materializing an intermediate result, usually to
+# re-read it — cheap on small inputs, a tempdb write amplifier on large ones.
+_SPOOL_OPS = {"Table Spool", "Index Spool", "Row Count Spool", "Window Spool"}
+
 # ShowPlan namespace
 NS = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
 
@@ -105,6 +109,60 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
         warnings.append(f"{conversions} implicit conversion(s) in predicate(s)")
     signals["implicit_conversion_count"] = conversions
 
+    # --- memory grant warnings (excessive/underestimated grant) ---
+    grant_warns = len(_findall(root, "MemoryGrantWarning"))
+    if grant_warns:
+        score -= min(10.0, grant_warns * 5.0)
+        warnings.append(f"{grant_warns} memory grant warning(s)")
+    signals["memory_grant_warning_count"] = grant_warns
+
+    # --- large spools (intermediate materialization, tempdb pressure) ---
+    spool_count = 0
+    for rel in _findall(root, "RelOp"):
+        if rel.get("PhysicalOp", "") in _SPOOL_OPS:
+            est_rows = float(rel.get("EstimateRows", "0") or 0)
+            if est_rows >= 10000:
+                spool_count += 1
+    if spool_count:
+        score -= min(10.0, spool_count * 3.0)
+        warnings.append(f"{spool_count} large spool(s)")
+    signals["spool_count"] = spool_count
+
+    # --- missing join predicate (accidental cross join) ---
+    no_join_pred = sum(
+        1 for w in _findall(root, "Warnings")
+        if (w.get("NoJoinPredicate") or "").lower() in ("1", "true")
+    )
+    if no_join_pred:
+        score -= 15.0
+        warnings.append("join without a join predicate (cartesian product)")
+    signals["no_join_predicate"] = no_join_pred
+
+    # --- scalar UDFs in the plan (row-by-row execution, blocks parallelism) ---
+    udfs = {
+        udf.get("FunctionName", "?")
+        for udf in _findall(root, "UserDefinedFunction")
+    }
+    if udfs:
+        score -= min(10.0, len(udfs) * 5.0)
+        warnings.append(f"scalar UDF(s) in plan: {', '.join(sorted(udfs))}")
+    signals["scalar_udf_count"] = len(udfs)
+
+    # --- parameter sniffing, directly: compiled vs runtime parameter values ---
+    # Actual plans record what values the plan was COMPILED for vs. what it RAN
+    # with. A mismatch means this combo executed on a plan shaped for different
+    # arguments — the definition of sniffing exposure. Reported as a signal
+    # always; scored (folded into the skew evidence) only when row-estimate
+    # skew confirms the mismatch actually hurt.
+    sniffed = []
+    for cr in root.findall(".//sp:ParameterList/sp:ColumnReference", NS):
+        compiled = cr.get("ParameterCompiledValue")
+        runtime = cr.get("ParameterRuntimeValue")
+        if compiled is not None and runtime is not None and compiled != runtime:
+            sniffed.append(f"{cr.get('Column', '?')} compiled={compiled} runtime={runtime}")
+    if sniffed:
+        signals["sniffed_params"] = sniffed
+
     # --- estimated vs actual row skew (only present in actual plans) ---
     skew_ops = 0
     for rel in _findall(root, "RelOp"):
@@ -120,8 +178,31 @@ def analyze_plan(cap: PlanCapture) -> PlanScore:
                 skew_ops += 1
     if skew_ops:
         score -= min(20.0, skew_ops * 5.0)
-        warnings.append(f"{skew_ops} op(s) with >10x estimate skew (sniffing?)")
+        if sniffed:
+            warnings.append(
+                f"{skew_ops} op(s) with >10x estimate skew — plan was compiled "
+                f"for different parameter values (sniffing confirmed)"
+            )
+        else:
+            warnings.append(f"{skew_ops} op(s) with >10x estimate skew (sniffing?)")
     signals["estimate_skew_ops"] = skew_ops
+
+    # --- multi-statement attribution: which statement dominates the cost ---
+    stmts = _findall(root, "StmtSimple")
+    signals["statement_count"] = len(stmts)
+    if len(stmts) > 1:
+        worst = max(stmts, key=lambda s: float(s.get("StatementSubTreeCost", "0") or 0))
+        cost = float(worst.get("StatementSubTreeCost", "0") or 0)
+        total = sum(float(s.get("StatementSubTreeCost", "0") or 0) for s in stmts)
+        if total > 0 and cost > 0:
+            signals["costliest_statement"] = {
+                "cost_fraction": round(cost / total, 2),
+                "text": (worst.get("StatementText", "") or "").strip()[:160],
+            }
+
+    # --- session wait profile captured around the execution (actual mode) ---
+    if cap.wait_stats:
+        signals["top_waits_ms"] = cap.wait_stats
 
     # --- runtime inefficiency: many logical reads to emit few rows ---
     # Actual-mode only. Reading the whole table (high logical reads) to return a

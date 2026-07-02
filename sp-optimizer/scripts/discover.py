@@ -30,11 +30,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from itertools import combinations, product
 from typing import Optional
 
 from .models import ParamCombo, ProcParam
+
+_SHOWPLAN_NS = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
 
 
 def _combos_from_env() -> Optional[list[ParamCombo]]:
@@ -125,6 +128,132 @@ def values_from_query_store(cursor, proc_name: str, limit: int = 50) -> list[str
     try:
         cursor.execute(QUERY_STORE_VALUES_SQL, limit, proc_name)
         return [r.query_sql_text for r in cursor.fetchall()]
+    except Exception:
+        return []
+
+
+# The plans Query Store kept for this proc, most-executed first. Each plan's
+# XML records the parameter values it was COMPILED for — real production
+# arguments, better than anything inferred from column contents.
+QUERY_STORE_PLANS_SQL = """
+SELECT TOP (?) CAST(p.query_plan AS nvarchar(max)) AS query_plan
+FROM sys.query_store_plan p
+JOIN sys.query_store_query q ON q.query_id = p.query_id
+WHERE q.object_id = OBJECT_ID(?)
+ORDER BY p.last_execution_time DESC;
+"""
+
+QUERY_STORE_SUMMARY_SQL = """
+SELECT TOP (?) q.query_id, p.plan_id, p.is_forced_plan,
+       SUM(rs.count_executions)  AS executions,
+       AVG(rs.avg_duration)      AS avg_duration_us
+FROM sys.query_store_query q
+JOIN sys.query_store_plan p ON p.query_id = q.query_id
+LEFT JOIN sys.query_store_runtime_stats rs ON rs.plan_id = p.plan_id
+WHERE q.object_id = OBJECT_ID(?)
+GROUP BY q.query_id, p.plan_id, p.is_forced_plan
+ORDER BY SUM(rs.count_executions) DESC;
+"""
+
+
+def _clean_compiled_value(raw: Optional[str]) -> object:
+    """Normalize a ShowPlan ParameterCompiledValue into an EXEC-able value.
+
+    Compiled values arrive as T-SQL literals: "(42)", "N'BRG'", "'2024-06-01'",
+    "NULL". Strings are unquoted (with '' unescaped), numerics converted, NULL
+    mapped to None; anything unrecognized passes through as a string, which the
+    EXEC arg builder quotes safely."""
+    if raw is None:
+        return None
+    v = raw.strip()
+    while v.startswith("(") and v.endswith(")"):
+        v = v[1:-1].strip()
+    if v.upper() == "NULL":
+        return None
+    m = re.fullmatch(r"N?'(?P<s>.*)'", v, re.DOTALL)
+    if m:
+        return m.group("s").replace("''", "'")
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)
+    except ValueError:
+        pass
+    return v
+
+
+def combos_from_query_store(
+    cursor, proc_name: str, params: list[ProcParam], max_combos: int = 6
+) -> list[ParamCombo]:
+    """Mine REAL parameter combinations from Query Store plan XML.
+
+    Every plan Query Store kept for the proc records the argument values it was
+    compiled for (``ParameterCompiledValue``). Those are actual production
+    calls — the highest-fidelity workload source available. Returns [] when
+    Query Store is off, keeps no plans for the proc, or the values don't cover
+    the required parameters, so callers can blend in derived combos."""
+    inputs = [p for p in params if not p.is_output]
+    if not inputs:
+        return []
+    required = {p.name for p in inputs if not p.has_default}
+    try:
+        cursor.execute(QUERY_STORE_PLANS_SQL, max_combos * 4, proc_name)
+        rows = cursor.fetchall()
+    except Exception:
+        return []
+
+    combos: list[ParamCombo] = []
+    seen: set[tuple] = set()
+    for row in rows:
+        plan_xml = row[0]
+        if not plan_xml:
+            continue
+        try:
+            root = ET.fromstring(plan_xml)
+        except ET.ParseError:
+            continue
+        values: dict[str, object] = {}
+        for cr in root.findall(".//sp:ParameterList/sp:ColumnReference", _SHOWPLAN_NS):
+            name = cr.get("Column")
+            compiled = cr.get("ParameterCompiledValue")
+            if name and compiled is not None:
+                values[name] = _clean_compiled_value(compiled)
+        if not values or not required.issubset(values):
+            continue  # can't build a complete EXEC from this plan
+        key = tuple(sorted((k, str(v)) for k, v in values.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        combos.append(ParamCombo(
+            values=values,
+            label=f"query store: real call #{len(combos) + 1}",
+            weight=2.0,  # real traffic outweighs derived guesses
+        ))
+        if len(combos) >= max_combos:
+            break
+    return combos
+
+
+def query_store_plan_summary(cursor, proc_name: str, limit: int = 10) -> list[dict]:
+    """Query Store plan history for the proc (for the force_plan decision path).
+
+    Returns [{query_id, plan_id, is_forced, executions, avg_duration_ms}, ...]
+    ordered by execution count; [] when Query Store is unavailable."""
+    try:
+        cursor.execute(QUERY_STORE_SUMMARY_SQL, limit, proc_name)
+        out = []
+        for r in cursor.fetchall():
+            out.append({
+                "query_id": int(r.query_id),
+                "plan_id": int(r.plan_id),
+                "is_forced": bool(r.is_forced_plan),
+                "executions": int(r.executions) if r.executions is not None else 0,
+                "avg_duration_ms": round(float(r.avg_duration_us) / 1000.0, 1)
+                                   if r.avg_duration_us is not None else None,
+            })
+        return out
     except Exception:
         return []
 
@@ -593,21 +722,46 @@ def discover(
 ) -> tuple[list[ProcParam], list[ParamCombo]]:
     """Return (signature, candidate parameter combos) for ANY procedure.
 
-    Workload sources are tried in priority order; the first that yields combos
-    wins, and every source degrades safely to the next:
+    Workload sources are tried in priority order, and every source degrades
+    safely to the next:
       1. SP_OPT_COMBOS file  — explicit, fully hand-curated workload.
-      2. data-derived        — windows anchored to the proc's real column ranges.
-      3. synthesized         — type-based boundary values (always succeeds).
+      2. Query Store         — REAL parameter values recent production calls
+                               were compiled with (blended with data-derived
+                               combos: real traffic shows where the proc lives,
+                               the derived spread shows where it breaks).
+      3. data-derived        — windows anchored to the proc's real column ranges.
+      4. synthesized         — type-based boundary values (always succeeds).
     """
     params = get_signature(cursor, proc_name)
 
     combos = _combos_from_env()
     if combos is None:
         proc_text = get_proc_text(cursor, proc_name)
+        qs_combos: list[ParamCombo] = []
+        if use_query_store:
+            try:
+                # Cap Query Store's share so the derived sniffing spread
+                # (narrow → wide → empty) always keeps room in the workload.
+                qs_combos = combos_from_query_store(
+                    cursor, proc_name, params, max_combos=max(1, max_combos // 2)
+                )
+            except Exception:
+                qs_combos = []
         try:
-            combos = derive_combos_from_data(cursor, params, proc_text, max_combos=max_combos)
+            derived = derive_combos_from_data(cursor, params, proc_text, max_combos=max_combos)
         except Exception:
-            combos = None
+            derived = None
+        merged: list[ParamCombo] = []
+        seen: set[tuple] = set()
+        for combo in qs_combos + (derived or []):
+            key = tuple(sorted((k, str(v)) for k, v in combo.values.items()))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged.append(combo)
+            if len(merged) >= max_combos:
+                break
+        combos = merged or None
     if combos is None:
         combos = synthesize_combos(params, max_combos=max_combos)
     return params, combos

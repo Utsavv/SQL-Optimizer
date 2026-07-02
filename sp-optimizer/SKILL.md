@@ -17,39 +17,49 @@ This skill is **procedure-agnostic** — point it at *any* stored procedure in a
 
 ```
   ┌─────────────────────────────────────────────────────────────┐
-  │ 1. DISCOVER   parse SP signature → explore the tables it      │
-  │               filters for real values + enumerate optional-   │
-  │               param NULL combinations (the "workload")        │
+  │ 0. REVIEW     deterministic T-SQL lint of the proc text       │
+  │               (SARGability, type mismatches, catch-alls) —    │
+  │               root causes the plan can only show symptoms of  │
+  │ 1. DISCOVER   parse SP signature → mine Query Store for REAL  │
+  │               call values + explore the tables it filters +   │
+  │               enumerate optional-param NULL combinations      │
   │ 2. CAPTURE    for each combo, get the estimated + actual      │
-  │               execution plan and runtime stats                │
+  │               execution plan and runtime stats (median of     │
+  │               --runs executions, session wait profile)        │
   │ 3. ANALYZE    parse plan XML → score plans, find bottlenecks  │
-  │               (scans, spills, sniffing skew, missing indexes) │
-  │ 4. DECIDE     LLM proposes targeted changes (hints, OPTION,   │
-  │               index, rewrite), grounded in cached or fresh    │
-  │               Microsoft Learn guidance. Stop if good enough.  │
-  │ 5. APPLY      apply change to a sandbox copy of the SP        │
-  │ 6. VERIFY     re-capture plans across the SAME workload       │
-  │               → did the majority improve without regressions? │
+  │               (scans, spills, sniffing, grants, spools, UDFs) │
+  │ 4. DECIDE     LLM proposes ONE targeted change (hint, OPTION, │
+  │               index, rewrite, plan forcing), grounded in the  │
+  │               review findings, attempt history, and cached or │
+  │               fresh Microsoft Learn guidance.                 │
+  │ 5. APPLY      guardrail-check indexes (overlap, size, write   │
+  │               tax), then apply to a sandbox copy of the SP    │
+  │ 6. VERIFY     re-capture plans across the SAME workload —     │
+  │               any combo regressing beyond tolerance rolls the │
+  │               change BACK and the loop reverts and retries    │
   └──────────────────────────┬──────────────────────────────────┘
                              │ repeat 2–6 until termination
                              ▼
-                  best variant + full report
+       best variant + full report; non-winning changes rolled back
 ```
 
 ## Termination conditions
 
 Stop the loop when ANY of these is true:
-- A target fraction (default 80%) of parameter combinations land on a plan scoring at/above the quality threshold, AND no combination regressed beyond a tolerance.
+- A target fraction (default 80%, weighted by combo weight) of parameter combinations land on a plan scoring at/above the quality threshold, AND no combination regressed beyond a tolerance (`--regression-tolerance`, default 10 points — enforced: a change that regresses any combo beyond it is rolled back and the loop reverts to the previous variant).
 - `max_iterations` reached (default 5).
-- Two consecutive iterations produce no net improvement in the aggregate workload score.
+- Two consecutive iterations produce no net improvement in the aggregate workload score (rolled-back, rejected, and failed attempts count as no-improvement rounds).
 - The LLM explicitly declares it has no safe change left to propose.
+
+At end of run, every change that is not part of the winning variant — including a final, never-verified change — is rolled back so the database ends the run carrying only the winner (`--no-auto-rollback` opts out).
 
 ## Safety rules (non-negotiable)
 
-1. **Never modify the live procedure.** All changes are applied to a sandbox copy (`<proc>_opt_v<n>`) or wrapped in an explicit transaction the user must approve before commit.
+1. **Never modify the live procedure.** All changes are applied to a sandbox copy (`<proc>_opt_v<n>`) or wrapped in an explicit transaction the user must approve before commit. (Enforced in code: the sandbox name is created first and handed to the decision step, and `drop_sandbox` refuses to touch any object not named `*_opt_v<n>`.)
 2. **Read-only by default for plan capture.** Use estimated plans + Query Store where possible; only run actual execution against non-production or with explicit user confirmation.
-3. **Always produce a diff and a rollback script** for any change before applying it.
-4. **Never auto-create indexes on production** without surfacing the cost/space impact and getting confirmation. Any proposed index must follow `references/indexing-best-practices.md` — an extra index is a permanent write tax, so the bar is deliberately high.
+3. **Always produce a diff and a rollback script** for any change before applying it — and the rollback is *executed* automatically when a change regresses a combo or loses to the winner.
+4. **Never auto-create indexes on production** without surfacing the cost/space impact and getting confirmation. Any proposed index must follow `references/indexing-best-practices.md` — an extra index is a permanent write tax, so the bar is deliberately high. (Enforced in code: `scripts/guardrails.py` rejects indexes whose keys are a left-prefix of an existing index and logs an estimated size + write-tax note for every index it allows.)
+5. **Query Store plan forcing changes live behavior** and is therefore opt-in: the decision step is only offered the plan history — and may only return `kind="force_plan"` — when the run starts with `--allow-plan-forcing`.
 
 ## Operating procedure for any stored procedure
 
@@ -57,7 +67,7 @@ The same flow applies to every proc — substitute the name and connection; noth
 
 1. **Name the target.** Any schema-qualified proc: `--proc "<schema>.<proc>"`. No allow-list, no per-proc setup.
 2. **Connect.** Pass `--conn` or set `SQL_CONNECTION_STRING` in `.env`; the CLI reads it automatically.
-3. **Let the workload be derived.** `discover.py` reads the signature from `sys.parameters`, then builds the workload **from the proc's own data**: it maps each parameter to the column it filters and mines that column's real contents. Datetime range/bound params fan out narrow → medium → wide → empty windows (the spread that exposes parameter-sniffing skew); equality/other params are exercised with real frequency-ranked values (a hot common value and a selective rare one) that actually exist in the table. On top of that, **optional / catch-all params** (declared with a default, or guarded by `@p IS NULL OR …` / `ISNULL` / `COALESCE`) are enumerated on the NULL-vs-supplied axis, so every combination of "which optional filters are active" — each a potentially different plan — is captured. No hand-written combos are needed; you can still override with a curated `SP_OPT_COMBOS` file when you want exact values, and raise `--max-combos` when a proc has many optional params.
+3. **Let the workload be derived.** `discover.py` reads the signature from `sys.parameters`, then blends two data-anchored sources: **Query Store** — the real argument values recent production calls were compiled with (highest fidelity, used when Query Store is on) — and the proc's **own data**: it maps each parameter to the column it filters and mines that column's real contents. Datetime range/bound params fan out narrow → medium → wide → empty windows (the spread that exposes parameter-sniffing skew); equality/other params are exercised with real frequency-ranked values (a hot common value and a selective rare one) that actually exist in the table. On top of that, **optional / catch-all params** (declared with a default, or guarded by `@p IS NULL OR …` / `ISNULL` / `COALESCE`) are enumerated on the NULL-vs-supplied axis, so every combination of "which optional filters are active" — each a potentially different plan — is captured. No hand-written combos are needed; you can still override with a curated `SP_OPT_COMBOS` file when you want exact values, and raise `--max-combos` when a proc has many optional params.
 4. **Run the loop.** Capture → analyze → decide → apply-to-sandbox → re-verify, until a termination condition is met.
 5. **Review outputs** under the run's output dir: the report, the applied changes + rollbacks, and the winning variant.
 
@@ -74,11 +84,16 @@ python -m scripts.optimize \
   --target-fraction 0.8 \
   --out-dir out
 # Each run lands in out/<schema.proc>/<timestamp>/ with the report, run.log,
-# changes.sql, winner.sql, manifest.json, and the evidence/ folder.
+# changes.sql, winner.sql, manifest.json, review.json, and the evidence/ folder.
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
 # --model defaults to LLM_MODEL (.env), or ollama_chat/gemma4 against a local
 # Ollama server (http://localhost:11434) if neither is set.
-# add --actual to capture runtime stats (executes the proc — non-prod only).
+# add --actual to capture runtime stats (executes the proc — non-prod only),
+#   --runs 3 for median-of-3 timings (plus a discarded warm-up) in actual mode,
+#   --regression-tolerance to tune the per-combo rollback gate (default 10),
+#   --query-timeout to bound any single statement (default 300s),
+#   --allow-plan-forcing to let the decision step pin a Query Store plan,
+#   --no-auto-rollback to keep losing changes on the database at end of run.
 ```
 
 PowerShell equivalent:
@@ -96,11 +111,33 @@ python -m scripts.optimize `
 ```
 
 Walk through the modules in this order when reading or extending the code:
-1. `scripts/discover.py` — parameter discovery + data-derived workload (see `references/parameter-discovery.md`)
-2. `scripts/capture.py` — execution plan + runtime capture
-3. `scripts/analyze.py` — plan XML scoring (see `references/plan-analysis.md`)
-4. `scripts/optimize.py` — the orchestration loop + LLM decision step
-5. `scripts/llm.py` — pluggable LLM backend (any provider via LiteLLM, or replay); the decision prompt encodes the index discipline from `references/indexing-best-practices.md`
+1. `scripts/discover.py` — parameter discovery + Query Store mining + data-derived workload (see `references/parameter-discovery.md`)
+2. `scripts/review.py` — deterministic T-SQL lint + param/column type checks; findings feed the decision prompt and the report
+3. `scripts/capture.py` — execution plan + runtime capture (median-of-N runs, session wait profile)
+4. `scripts/analyze.py` — plan XML scoring (see `references/plan-analysis.md`)
+5. `scripts/guardrails.py` — deterministic index checks (overlap rejection, size + write-tax evidence) run before any index is created
+6. `scripts/optimize.py` — the orchestration loop + LLM decision step + regression gate + rollbacks
+7. `scripts/llm.py` — pluggable LLM backend (any provider via LiteLLM, or replay); the decision prompt encodes the index discipline from `references/indexing-best-practices.md`
+8. `scripts/simulate.py` — proc-shaped load simulator + paired under-load A/B validation (baseline vs winner), with session wait profiles
+
+Offline test suite: `cd sp-optimizer && python -m pytest tests` (no SQL Server needed — DB-facing steps are faked).
+
+### Validating the winner under load
+
+Plan shape is decided by statistics and parameters, not concurrency, so the
+loop tunes plans idle. What only load reveals is waits (blocking, tempdb/log
+contention) and the write tax of a new index. After a run, validate with:
+
+```bash
+python -m scripts.simulate --proc "<schema>.<proc>" \
+  --compare-proc "<schema>.<proc>_opt_v<n>" --threads 8 --duration 120
+```
+
+Each worker executes baseline and candidate back-to-back with the same combo
+(paired A/B) and the report includes p50/p95 deltas plus the top wait types.
+For maximum realism, capture real production calls with
+`workload-drivers/xe_capture.sql` + `workload-drivers/capture_replay.py` and
+replay them against a test copy while the A/B runs.
 
 ## Decision grounding (Microsoft Learn MCP, cached)
 
@@ -141,9 +178,10 @@ runs never collide and each is fully self-contained:
 out/<schema.proc>/<YYYY-MM-DD_HHMMSS>/
   report.html      self-contained HTML report (links into evidence/)
   run.log          structured, timestamped step-by-step log of the whole loop
-  changes.sql      every applied change + its rollback, in order
+  changes.sql      every applied change + its rollback, in order (rolled-back ones annotated)
   winner.sql       the best-performing procedure variant + the changes that produced it
   manifest.json    machine-readable index of every iteration, combo, and evidence file
+  review.json      static T-SQL review findings for the procedure
   evidence/
     iter<n>/
       <combo>.plan.xml        the execution plan captured for that combo

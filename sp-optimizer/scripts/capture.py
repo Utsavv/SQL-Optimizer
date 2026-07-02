@@ -11,6 +11,7 @@ is never touched.
 from __future__ import annotations
 
 import re
+import statistics
 import xml.etree.ElementTree as ET
 from typing import Optional
 
@@ -117,6 +118,43 @@ def _drain_messages(cursor, sink: list[str]) -> None:
             sink.append(cleaned)
 
 
+# Ignorable idle waits that would otherwise dominate every session snapshot.
+_IDLE_WAITS = {
+    "WAITFOR", "SLEEP_TASK", "BROKER_RECEIVE_WAITFOR",
+    "LAZYWRITER_SLEEP", "SQLTRACE_INCREMENTAL_FLUSH_SLEEP",
+}
+
+_SESSION_WAITS_SQL = """
+SELECT wait_type, wait_time_ms
+FROM sys.dm_exec_session_wait_stats
+WHERE session_id = @@SPID AND wait_time_ms > 0;
+"""
+
+
+def _session_wait_snapshot(cursor) -> Optional[dict[str, float]]:
+    """Cumulative session waits (wait_type -> ms). Best-effort: returns None
+    when the DMV isn't visible (permissions/edition), so callers degrade."""
+    try:
+        cursor.execute(_SESSION_WAITS_SQL)
+        return {r.wait_type: float(r.wait_time_ms) for r in cursor.fetchall()}
+    except Exception:
+        return None
+
+
+def _wait_delta(before: Optional[dict], after: Optional[dict], top: int = 5) -> Optional[dict]:
+    """Waits accumulated between two snapshots, top-N by time, idle waits dropped."""
+    if before is None or after is None:
+        return None
+    delta = {}
+    for wt, ms in after.items():
+        d = ms - before.get(wt, 0.0)
+        if d > 0 and wt not in _IDLE_WAITS:
+            delta[wt] = round(d, 1)
+    if not delta:
+        return None
+    return dict(sorted(delta.items(), key=lambda kv: kv[1], reverse=True)[:top])
+
+
 def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
     """Actual plan + runtime stats. EXECUTES the proc — non-prod / confirmed only.
 
@@ -130,6 +168,7 @@ def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
     args = _arg_list(combo)
     exec_stmt = f"EXEC {proc_name} {args};" if args else f"EXEC {proc_name};"
     io_msgs: list[str] = []
+    waits_before = _session_wait_snapshot(cursor)
     try:
         cursor.execute("SET STATISTICS XML ON; SET STATISTICS IO ON; SET STATISTICS TIME ON;")
         cursor.execute(exec_stmt)
@@ -153,6 +192,7 @@ def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
             combo=combo,
             plan_xml=plan_xml,
             io_stats_text="\n".join(io_msgs).strip() or None,
+            wait_stats=_wait_delta(waits_before, _session_wait_snapshot(cursor)),
         )
         _attach_runtime(cap)
         return cap
@@ -168,11 +208,45 @@ def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
         )
 
 
+def capture_actual_repeated(cursor, proc_name: str, combo: ParamCombo, runs: int) -> PlanCapture:
+    """Run the combo (runs + 1) times — one discarded warm-up, then ``runs``
+    measured executions — and report the MEDIAN elapsed/CPU/reads.
+
+    A single execution mixes compile time and cold-cache IO into the numbers,
+    so a 10% 'win' can be pure noise; the warm-up absorbs compilation and the
+    median resists outliers. The representative capture (plan XML, IO text,
+    waits) is the run with the median elapsed time, its headline metrics
+    replaced by the per-metric medians."""
+    if runs <= 1:
+        return capture_actual(cursor, proc_name, combo)
+
+    capture_actual(cursor, proc_name, combo)  # warm-up: compile + buffer pool
+    caps = [capture_actual(cursor, proc_name, combo) for _ in range(runs)]
+    ok = [c for c in caps if not c.error and c.plan_xml]
+    if not ok:
+        return caps[-1]
+
+    def _median(vals):
+        vals = [v for v in vals if v is not None]
+        return statistics.median(vals) if vals else None
+
+    med_elapsed = _median([c.elapsed_ms for c in ok])
+    # pick the run closest to the median elapsed as the representative capture
+    rep = min(ok, key=lambda c: abs((c.elapsed_ms or 0) - (med_elapsed or 0)))
+    rep.elapsed_ms = med_elapsed
+    rep.cpu_ms = _median([c.cpu_ms for c in ok])
+    reads = _median([c.logical_reads for c in ok])
+    rep.logical_reads = int(reads) if reads is not None else None
+    return rep
+
+
 def capture_workload(
     cursor,
     proc_name: str,
     combos: list[ParamCombo],
     actual: bool = False,
+    runs: int = 1,
 ) -> list[PlanCapture]:
-    fn = capture_actual if actual else capture_estimated
-    return [fn(cursor, proc_name, c) for c in combos]
+    if actual:
+        return [capture_actual_repeated(cursor, proc_name, c, runs) for c in combos]
+    return [capture_estimated(cursor, proc_name, c) for c in combos]
