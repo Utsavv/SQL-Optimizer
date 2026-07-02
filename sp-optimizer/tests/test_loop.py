@@ -224,3 +224,25 @@ def test_winner_excludes_invalidated_variant(tmp_path):
     assert best.iteration == 0
     text = run.winner_path.read_text()
     assert "SELECT 0" in text
+
+
+def test_force_plan_rejected_without_opt_in(tmp_path, monkeypatch):
+    """kind='force_plan' changes live query behavior and must be rejected
+    unless the run opted in via allow_plan_forcing."""
+    force = Change(kind="force_plan", rationale="pin plan 3",
+                   apply_sql="EXEC sys.sp_query_store_force_plan 10, 3;",
+                   rollback_sql="EXEC sys.sp_query_store_unforce_plan 10, 3;",
+                   target_object="query 10 / plan 3")
+    backend = ScriptedBackend([force])
+    history, cursor, _ = _run(
+        tmp_path, monkeypatch,
+        scripted_scores=[
+            _scores([("c1", 60), ("c2", 60)]),
+            _scores([("c1", 60), ("c2", 60)]),
+        ],
+        backend=backend,
+        max_iterations=2, target_fraction=0.99,
+    )
+    assert not any("sp_query_store_force_plan" in sql for sql in cursor.executed)
+    rejected = [a for a in backend.contexts[-1].attempts if a.outcome == "rejected"]
+    assert rejected and rejected[0].kind == "force_plan"

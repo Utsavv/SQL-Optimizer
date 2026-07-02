@@ -93,9 +93,13 @@ def make_sandbox(cursor, source_proc: str, base_proc: str, version: int) -> str:
 
 def drop_sandbox(cursor, sandbox: str) -> None:
     """Drop a sandbox proc that ended up unused (decision was 'none'/rejected).
-    Best-effort — a leftover empty sandbox is harmless and CLEANUP.sql catches it."""
+    Refuses any name that isn't a *_opt_v<n> sandbox — this function must never
+    be able to touch the live procedure, whatever the caller passes. Best-effort
+    otherwise: a leftover empty sandbox is harmless and CLEANUP.sql catches it."""
     try:
         schema, short = _split_schema_proc(sandbox)
+        if not re.search(r"_opt_v\d+$", short):
+            return
         cursor.execute(
             f"IF OBJECT_ID('{schema}.{short}') IS NOT NULL DROP PROCEDURE [{schema}].[{short}];"
         )
@@ -158,6 +162,7 @@ def run_loop(
     max_combos: int = 12,
     auto_rollback: bool = True,
     runs_per_combo: int = 1,
+    allow_plan_forcing: bool = False,
 ) -> list[IterationResult]:
     params, combos = discover.discover(cursor, proc_name, max_combos=max_combos)
     run.log(
@@ -179,6 +184,15 @@ def run_loop(
             run.log(f"review ·   [{f.severity}] {f.rule}: {f.message}", echo=False)
     else:
         run.log("review · no static findings")
+
+    # Query Store plan history is only offered to the decision step when the
+    # user explicitly allowed plan forcing: forcing changes LIVE query behavior
+    # (it is not sandboxed), so it stays opt-in.
+    qs_plans: list[dict] = []
+    if allow_plan_forcing:
+        qs_plans = discover.query_store_plan_summary(cursor, proc_name)
+        if qs_plans:
+            run.log(f"query store · {len(qs_plans)} plan(s) available for forcing")
 
     history: list[IterationResult] = []
     attempts: list[AttemptRecord] = []
@@ -286,13 +300,34 @@ def run_loop(
         version += 1
         sandbox = make_sandbox(cursor, current_proc, proc_name, version)
         context = DecisionContext(sandbox_proc=sandbox, attempts=list(attempts),
-                                  review_findings=findings)
+                                  review_findings=findings,
+                                  query_store_plans=qs_plans)
         change = backend.propose_change(proc_def, scores, context)
         if change.kind == "none" or not change.apply_sql.strip():
             drop_sandbox(cursor, sandbox)
             run.log(f"[iter {it}] STOP — no safe change proposed")
             break
         run.log(f"[iter {it}] decide · {change.kind} on {change.target_object}: {change.rationale}", echo=False)
+
+        # --- plan forcing acts on LIVE query behavior — hard-gated -----------
+        if change.kind == "force_plan" and not allow_plan_forcing:
+            attempts.append(AttemptRecord(
+                iteration=it, kind=change.kind, target_object=change.target_object,
+                outcome="rejected",
+                detail="plan forcing not allowed for this run (--allow-plan-forcing)",
+            ))
+            drop_sandbox(cursor, sandbox)
+            run.log(f"[iter {it}] REJECTED force_plan — run started without --allow-plan-forcing")
+            stall_streak += 1
+            if stall_streak >= 2:
+                run.log(f"[iter {it}] STOP — {stall_streak} consecutive failed round(s)")
+                break
+            continue
+        if change.kind == "force_plan":
+            # Forcing needs no sandbox: it pins a plan for the live queries and
+            # is verified by re-capturing the SAME proc next iteration.
+            drop_sandbox(cursor, sandbox)
+            sandbox = current_proc
 
         # --- guardrails: deterministic checks before an index is created ------
         if change.kind == "index":
@@ -414,6 +449,10 @@ def main(argv=None):
     ap.add_argument("--no-auto-rollback", action="store_true",
                     help="keep every applied change on the database at end of run "
                          "(default: changes not part of the winner are rolled back)")
+    ap.add_argument("--allow-plan-forcing", action="store_true",
+                    help="let the decision step propose Query Store plan forcing "
+                         "(sp_query_store_force_plan). Affects LIVE query behavior "
+                         "— it is not sandboxed — so it is opt-in")
     ap.add_argument("--out-dir", default="out",
                     help="base output dir; each run lands in "
                          "<out-dir>/<schema.proc>/<timestamp>/ (default: out)")
@@ -457,6 +496,7 @@ def main(argv=None):
             max_combos=args.max_combos,
             auto_rollback=not args.no_auto_rollback,
             runs_per_combo=args.runs,
+            allow_plan_forcing=args.allow_plan_forcing,
         )
 
         # End-of-run artifacts, all inside the run folder alongside the evidence.
