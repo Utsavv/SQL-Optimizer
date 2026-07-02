@@ -73,6 +73,15 @@ class Change:
 
 
 @dataclass
+class ReviewFinding:
+    """One finding from the deterministic T-SQL review step."""
+    rule: str                 # e.g. "non_sargable_predicate"
+    severity: str             # "high" | "medium" | "info"
+    message: str
+    snippet: str = ""         # the offending fragment, when text-anchored
+
+
+@dataclass
 class AttemptRecord:
     """One change the loop already tried, and what became of it.
 

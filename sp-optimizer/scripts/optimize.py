@@ -21,7 +21,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed; rely on environment variables directly
 
-from . import analyze, capture, discover
+from . import analyze, capture, discover, review
 from .evidence import RunDir
 from .llm import FileBackend, LiteLLMBackend, LLMBackend
 from .models import (
@@ -163,6 +163,22 @@ def run_loop(
         f"discover · {len(params)} param(s), {len(combos)} workload combo(s): "
         + ", ".join(c.label or "default" for c in combos)
     )
+
+    # Static review of the ORIGINAL procedure, once per run. Deterministic and
+    # read-only; findings ground the decision step and appear in the report.
+    findings = review.review_procedure(
+        cursor, proc_name, get_proc_text(cursor, proc_name), params
+    )
+    run.write_review(findings)
+    if findings:
+        run.log(f"review · {len(findings)} finding(s): "
+                + ", ".join(f"{f.severity}:{f.rule}" for f in findings[:8])
+                + ("…" if len(findings) > 8 else ""))
+        for f in findings:
+            run.log(f"review ·   [{f.severity}] {f.rule}: {f.message}", echo=False)
+    else:
+        run.log("review · no static findings")
+
     history: list[IterationResult] = []
     attempts: list[AttemptRecord] = []
     current_proc = proc_name
@@ -267,7 +283,8 @@ def run_loop(
         # Cloning from current_proc lets changes compound across iterations.
         version += 1
         sandbox = make_sandbox(cursor, current_proc, proc_name, version)
-        context = DecisionContext(sandbox_proc=sandbox, attempts=list(attempts))
+        context = DecisionContext(sandbox_proc=sandbox, attempts=list(attempts),
+                                  review_findings=findings)
         change = backend.propose_change(proc_def, scores, context)
         if change.kind == "none" or not change.apply_sql.strip():
             drop_sandbox(cursor, sandbox)
@@ -658,6 +675,35 @@ def _evidence_links(s) -> str:
     return " · ".join(links) if links else '<span class="muted">—</span>'
 
 
+_SEVERITY_CLASS = {"high": "bad", "medium": "warn", "info": "neutral"}
+
+
+def _render_review(run) -> str:
+    """The static T-SQL review findings, when the run produced any."""
+    if run is None or not getattr(run, "review_findings", None):
+        return ""
+    rows = []
+    for f in run.review_findings:
+        cls = _SEVERITY_CLASS.get(f.severity, "neutral")
+        snippet = f'<code>{_esc(f.snippet)}</code>' if f.snippet else '<span class="muted">—</span>'
+        rows.append(
+            f'<tr><td><span class="badge {cls}">{_esc(f.severity)}</span></td>'
+            f'<td><code>{_esc(f.rule)}</code></td>'
+            f'<td>{_esc(f.message)}</td>'
+            f'<td class="warn-cell">{snippet}</td></tr>'
+        )
+    return f"""
+    <section class="card" id="review">
+      <h2>Static T-SQL review</h2>
+      <p class="muted">Deterministic linter findings on the procedure text —
+      root causes the execution plan can only show symptoms of. Also fed to the
+      decision step.</p>
+      <div class="table-wrap"><table>
+      <thead><tr><th>Severity</th><th>Rule</th><th>Finding</th><th>Snippet</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody></table></div>
+    </section>"""
+
+
 def _render_artifacts(run) -> str:
     """A section listing the run folder and every persisted artifact, so the
     reader knows exactly where the raw evidence lives on disk."""
@@ -805,6 +851,8 @@ def _render_html(history: list[IterationResult], proc_name: str, run=None) -> st
         nav = ""
     else:
         nav_links = ['<a href="#summary">Summary</a>', '<a href="#tried">What was tried</a>']
+        if run is not None and getattr(run, "review_findings", None):
+            nav_links.append('<a href="#review">Review</a>')
         nav_links += [f'<a href="#iter-{r.iteration}">Iter {r.iteration}</a>' for r in history]
         if run is not None:
             nav_links.append('<a href="#artifacts">Evidence</a>')
@@ -812,6 +860,7 @@ def _render_html(history: list[IterationResult], proc_name: str, run=None) -> st
         body = (
             _render_summary(history, proc_name)
             + _render_timeline(history)
+            + _render_review(run)
             + "".join(_render_iteration(r) for r in history)
             + _render_artifacts(run)
         )

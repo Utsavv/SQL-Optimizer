@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .models import Change, IterationResult, PlanCapture, PlanScore
+from .models import Change, IterationResult, PlanCapture, PlanScore, ReviewFinding
 
 
 def _slug(text: str, fallback: str = "item") -> str:
@@ -63,7 +63,11 @@ class RunDir:
         self.changes_path = self.root / "changes.sql"
         self.winner_path = self.root / "winner.sql"
         self.manifest_path = self.root / "manifest.json"
+        self.review_path = self.root / "review.json"
         self.log_path = self.root / "run.log"
+        # Findings from the static T-SQL review step, stashed here by
+        # write_review so the report renderer can include them.
+        self.review_findings: list[ReviewFinding] = []
         self._log_fh = open(self.log_path, "a", encoding="utf-8")
         self.log(f"run start · proc={proc_name} · dir={self.root}")
 
@@ -128,6 +132,21 @@ class RunDir:
             )
 
         return plan_rel, stats_rel
+
+    # ---- static review findings ----------------------------------------------
+
+    def write_review(self, findings: list[ReviewFinding]) -> None:
+        """Persist the static T-SQL review findings for the run (review.json)
+        and keep them on the RunDir for the report renderer."""
+        self.review_findings = list(findings)
+        payload = [
+            {"rule": f.rule, "severity": f.severity,
+             "message": f.message, "snippet": f.snippet}
+            for f in findings
+        ]
+        self.review_path.write_text(
+            json.dumps(payload, indent=2, default=str), encoding="utf-8"
+        )
 
     # ---- end-of-run artifacts ----------------------------------------------
 
@@ -246,6 +265,7 @@ class RunDir:
                 "run_log": self.log_path.name,
                 "changes": self.changes_path.name,
                 "winner": self.winner_path.name,
+                "review": self.review_path.name if self.review_path.exists() else None,
             },
             "iterations": iterations,
         }
