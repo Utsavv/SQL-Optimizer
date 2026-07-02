@@ -144,13 +144,18 @@ offline.
 
 | Module | Step it serves | Role | LLM? |
 |---|---|---|---|
-| `scripts/discover.py` | Discover | parameter space → workload combos, **auto-derived from the proc's real data** (`derive_combos_from_data`) | no |
-| `scripts/capture.py` | Capture | execution plan + runtime capture | no |
-| `scripts/analyze.py` | Analyze | deterministic plan-XML scoring | no |
+| `scripts/discover.py` | Discover | parameter space → workload combos: **real Query Store call values** blended with combos **auto-derived from the proc's real data** (`derive_combos_from_data`) | no |
+| `scripts/review.py` | Review | deterministic T-SQL lint (SARGability, catch-alls, NOLOCK, …) + param/column type mismatch via `sys.columns`; findings feed the report and the decision prompt | no |
+| `scripts/capture.py` | Capture | execution plan + runtime capture (median of `--runs` executions, session wait profile) | no |
+| `scripts/analyze.py` | Analyze | deterministic plan-XML scoring (scans, missing indexes, spills, memory grants, spools, scalar UDFs, compiled-vs-runtime sniffing) | no |
+| `scripts/guardrails.py` | Apply | pre-apply index checks: overlap rejection against existing indexes, size estimate, write-tax evidence | no |
 | `scripts/llm.py` | Decide | propose one safe change as strict JSON; pluggable LiteLLM / file backend | **yes** |
-| `scripts/optimize.py` | Apply + Verify | the loop + sandbox management + CLI + report | no |
+| `scripts/optimize.py` | Apply + Verify | the loop + sandbox management + per-combo regression gate + rollbacks + CLI + report | no |
 | `scripts/evidence.py` | Capture + Verify | writes per-combo plan XML / IO stats / score JSON into each run's `evidence/` folder | no |
+| `scripts/simulate.py` | Validate | proc-shaped load simulator + paired under-load A/B (baseline vs winner) with wait profiles | no |
 | `scripts/models.py` | all steps | shared dataclasses for combos, plans, scores, decisions | no |
+
+Offline test suite (no SQL Server needed): `cd sp-optimizer && python -m pytest tests`.
 
 The skill walks these in order — discover → capture → analyze → decide →
 apply → verify — and loops until a termination condition in `SKILL.md` is met.
@@ -172,7 +177,14 @@ python -m scripts.optimize \
 # winner.sql, manifest.json, and evidence/). Override the report path with --report.
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
 # --model defaults to LLM_MODEL (.env) if omitted.
-# Add --actual to capture runtime stats (executes the proc — non-prod only).
+# Add --actual to capture runtime stats (executes the proc — non-prod only),
+# --runs 3 for median-of-3 timings, --regression-tolerance for the rollback
+# gate, --allow-plan-forcing to enable Query Store plan forcing proposals,
+# and --no-auto-rollback to keep losing changes at end of run.
+
+# Validate the winner under load afterwards (paired A/B + wait profile):
+python -m scripts.simulate --proc "dbo.usp_GetMemberActivity" \
+  --compare-proc "dbo.usp_GetMemberActivity_opt_v2" --threads 8 --duration 120
 ```
 
 ## Install
@@ -254,11 +266,18 @@ workload. That loop — driven by the skill — is the contribution here.
 
 ## Safety
 
-- The live procedure is **never** modified — changes go to `<proc>_opt_v<n>`.
+- The live procedure is **never** modified — changes go to `<proc>_opt_v<n>`,
+  and `drop_sandbox` refuses to touch any object not named `*_opt_v<n>`.
 - Estimated plans are read-only; actual execution is opt-in (non-prod only).
-- Every change carries a rollback; all changes are written to `changes.sql`.
-- Indexes are never auto-created on production without surfacing cost/space
-  impact and getting confirmation.
+- Every change carries a rollback; all changes are written to `changes.sql` —
+  and rollbacks are **executed** automatically when a change regresses any
+  combo beyond `--regression-tolerance` or is not part of the winning variant
+  at end of run (`--no-auto-rollback` opts out).
+- Proposed indexes pass deterministic guardrails before creation: overlap
+  with an existing index is rejected outright, and an estimated size +
+  write-tax note is logged for every index that is allowed.
+- Query Store plan forcing changes live behavior, so it is only offered to
+  the decision step behind `--allow-plan-forcing`.
 - `setup/CLEANUP.sql` gives you a known-good rollback path for whatever
   a run leaves behind.
 
@@ -308,10 +327,11 @@ not required to run the skill against your own proc.
 
 ## Status
 
-Scaffold / v0. The deterministic pipeline (discover + analyze) is tested
-offline, including the data-derived workload generator (`derive_combos_from_data`)
-that makes the skill generic across procedures. The DB-facing steps need a live
-SQL Server to exercise. Mining concrete argument values from Query Store and
-mapping more predicate shapes (multi-column, function-wrapped) are the next
-enhancements.
+The deterministic pipeline is covered by an offline pytest suite
+(`sp-optimizer/tests/`, no SQL Server needed): the loop's regression gate and
+rollback behavior, the T-SQL review rules, the plan-analyzer rules, the index
+guardrails, Query Store combo mining, and the simulator/replay helpers. The
+DB-facing paths (capture, sandbox DDL, wait-stats DMVs, XE ring buffer) need a
+live SQL Server to exercise end-to-end. Mapping more predicate shapes
+(multi-column, function-wrapped) in `discover.py` is the next enhancement.
 </content>
