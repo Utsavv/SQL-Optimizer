@@ -21,7 +21,7 @@ try:
 except ImportError:
     pass  # python-dotenv not installed; rely on environment variables directly
 
-from . import analyze, capture, discover, review
+from . import analyze, capture, discover, guardrails, review
 from .evidence import RunDir
 from .llm import FileBackend, LiteLLMBackend, LLMBackend
 from .models import (
@@ -293,6 +293,26 @@ def run_loop(
             run.log(f"[iter {it}] STOP — no safe change proposed")
             break
         run.log(f"[iter {it}] decide · {change.kind} on {change.target_object}: {change.rationale}", echo=False)
+
+        # --- guardrails: deterministic checks before an index is created ------
+        if change.kind == "index":
+            ok, notes = guardrails.check_index_change(cursor, change.apply_sql)
+            for n in notes:
+                run.log(f"[iter {it}] guardrail · {n}")
+            if not ok:
+                attempts.append(AttemptRecord(
+                    iteration=it, kind=change.kind, target_object=change.target_object,
+                    outcome="rejected", detail="; ".join(notes),
+                ))
+                drop_sandbox(cursor, sandbox)
+                run.log(f"[iter {it}] REJECTED index {change.target_object} by guardrail")
+                stall_streak += 1
+                if stall_streak >= 2:
+                    run.log(f"[iter {it}] STOP — {stall_streak} consecutive failed round(s)")
+                    break
+                continue
+            if notes:
+                change.rationale += " [guardrails: " + "; ".join(notes) + "]"
 
         # --- apply to the sandbox, verify next iteration ----------------------
         try:
