@@ -44,18 +44,21 @@ fi
 
 # ── 3. Wait for SQL Server to be ready ────────────────────
 echo "[3/5] Waiting for SQL Server to be ready..."
+READY=0
 for i in $(seq 1 60); do
   if docker exec sqlserver "$SQLCMD" \
       -S localhost -U sa -P "${SA_PASSWORD}" -C -Q "SELECT 1" &>/dev/null; then
     echo "      SQL Server is ready ✓"
+    READY=1
     break
   fi
   echo "      Waiting... ($i/60)"
   sleep 3
-  if [ $i -eq 60 ]; then
-    echo "WARNING: Timed out waiting. Check logs: docker logs -f sqlserver"
-  fi
 done
+if [ "$READY" -ne 1 ]; then
+  echo "ERROR: Timed out waiting for SQL Server. Check logs: docker logs -f sqlserver" >&2
+  exit 1
+fi
 
 # ── 4. Download WideWorldImporters backup ─────────────────
 BAK="$HOME/sql-backups/WideWorldImporters-Full.bak"
