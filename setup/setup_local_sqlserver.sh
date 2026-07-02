@@ -107,3 +107,8 @@ echo ""
 echo "  pyodbc connection string:"
 echo "  DRIVER={ODBC Driver 18 for SQL Server};SERVER=localhost,1433;DATABASE=WideWorldImporters;UID=sa;PWD=${SA_PASSWORD};Encrypt=yes;TrustServerCertificate=yes;"
 echo "======================================================"
+
+VERIFY_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test_local_sqlserver.sh"
+if [ -f "$VERIFY_SCRIPT" ]; then
+  bash "$VERIFY_SCRIPT"
+fi

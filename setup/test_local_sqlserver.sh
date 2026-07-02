@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Verify local SQL Server container accepts sa login and serves WideWorldImporters.
+# Post-setup verification: sa login and WideWorldImporters must be queryable.
 set -euo pipefail
 
 SA_PASSWORD='@ATISecure1'
