@@ -147,11 +147,16 @@ class RunDir:
             if not c or c.kind == "none" or not c.apply_sql.strip():
                 continue
             any_change = True
+            status = (
+                " (ROLLED BACK during the run — no longer on the database)"
+                if r.change_rolled_back else ""
+            )
             lines += [
-                f"-- ===== Iteration {r.iteration}: {c.kind} {c.target_object} =====",
+                f"-- ===== Iteration {r.iteration}: {c.kind} {c.target_object}{status} =====",
                 f"-- {c.rationale}",
                 "",
-                c.apply_sql.strip(),
+                c.apply_sql.strip() if not r.change_rolled_back
+                else _comment_block(c.apply_sql.strip()),
                 "",
                 "-- Rollback:",
                 _comment_block(c.rollback_sql.strip()),
@@ -166,7 +171,10 @@ class RunDir:
         it. Returns the winning IterationResult (or None if there's no history)."""
         if not history:
             return None
-        best = max(history, key=lambda r: r.aggregate_score)
+        # A variant produced by a rolled-back change failed the no-regression
+        # contract — it can never be the winner even if its aggregate is highest.
+        candidates = [r for r in history if not r.variant_invalidated] or history
+        best = max(candidates, key=lambda r: r.aggregate_score)
         baseline = history[0]
         header = [
             f"-- Winning variant for {self.proc_name}",
@@ -189,6 +197,7 @@ class RunDir:
             if r.iteration < best.iteration
             and r.change_applied and r.change_applied.kind != "none"
             and r.change_applied.apply_sql.strip()
+            and not r.change_rolled_back
         ]
         if applied:
             for c in applied:
@@ -223,6 +232,8 @@ class RunDir:
                 "fraction_good": round(r.fraction_good, 4),
                 "scored_proc": r.scored_proc,
                 "change_applied": _change_dict(r.change_applied),
+                "change_rolled_back": r.change_rolled_back,
+                "variant_invalidated": r.variant_invalidated,
                 "regressions": r.regressions,
                 "combos": combos,
             })

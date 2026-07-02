@@ -25,8 +25,11 @@ from . import analyze, capture, discover
 from .evidence import RunDir
 from .llm import FileBackend, LiteLLMBackend, LLMBackend
 from .models import (
+    AttemptRecord,
     Change,
+    DecisionContext,
     IterationResult,
+    PlanScore,
     fraction_good,
     workload_score,
 )
@@ -59,20 +62,24 @@ def _split_schema_proc(proc_name: str) -> tuple[str, str]:
     return "dbo", parts[-1]
 
 
-def make_sandbox(cursor, proc_name: str, version: int) -> str:
-    """Clone the proc into <schema>.<proc>_opt_v<n> so the live object is never
-    touched. Handles schema-qualified and bracketed identifiers robustly so the
+def make_sandbox(cursor, source_proc: str, base_proc: str, version: int) -> str:
+    """Clone ``source_proc`` into <schema>.<base>_opt_v<n> so the live object is
+    never touched. Cloning from the CURRENT variant (not always the original)
+    lets changes compound across iterations: a body rewrite applied in v1
+    survives into v2 when v2 only adds an index. Naming stays anchored to the
+    original proc so every sandbox is recognisable and CLEANUP.sql can drop
+    them. Handles schema-qualified and bracketed identifiers robustly so the
     sandbox is created in the SAME schema as the original."""
-    original = get_proc_text(cursor, proc_name)
+    original = get_proc_text(cursor, source_proc)
     if not original:
-        raise RuntimeError(f"Could not read definition of {proc_name}")
-    schema, short = _split_schema_proc(proc_name)
-    sandbox_short = f"{short}_opt_v{version}"
+        raise RuntimeError(f"Could not read definition of {source_proc}")
+    schema, base_short = _split_schema_proc(base_proc)
+    sandbox_short = f"{base_short}_opt_v{version}"
     sandbox_name = f"[{schema}].[{sandbox_short}]"
 
     m = _PROC_HEADER_RE.search(original)
     if not m:
-        raise RuntimeError(f"Could not locate CREATE/ALTER PROCEDURE header in {proc_name}")
+        raise RuntimeError(f"Could not locate CREATE/ALTER PROCEDURE header in {source_proc}")
     # Force CREATE (the live ALTER target would otherwise be rewritten in place)
     body = (
         original[: m.start()]
@@ -82,6 +89,58 @@ def make_sandbox(cursor, proc_name: str, version: int) -> str:
     cursor.execute(f"IF OBJECT_ID('{schema}.{sandbox_short}') IS NOT NULL DROP PROCEDURE {sandbox_name};")
     cursor.execute(body)
     return f"{schema}.{sandbox_short}"
+
+
+def drop_sandbox(cursor, sandbox: str) -> None:
+    """Drop a sandbox proc that ended up unused (decision was 'none'/rejected).
+    Best-effort — a leftover empty sandbox is harmless and CLEANUP.sql catches it."""
+    try:
+        schema, short = _split_schema_proc(sandbox)
+        cursor.execute(
+            f"IF OBJECT_ID('{schema}.{short}') IS NOT NULL DROP PROCEDURE [{schema}].[{short}];"
+        )
+    except Exception:
+        pass
+
+
+def _run_sql_batches(cursor, sql: str) -> None:
+    for stmt in _split_batches(sql):
+        if stmt.strip():
+            cursor.execute(stmt)
+
+
+def _try_rollback(cursor, change: Change, run: RunDir, why: str) -> bool:
+    """Execute a change's rollback SQL. Returns True when it ran cleanly."""
+    if not change.rollback_sql.strip():
+        run.log(f"rollback SKIPPED — {change.kind} {change.target_object} has no "
+                f"rollback SQL ({why}); CLEANUP.sql is the fallback")
+        return False
+    try:
+        _run_sql_batches(cursor, change.rollback_sql)
+        run.log(f"rolled back {change.kind} {change.target_object} ({why})")
+        return True
+    except Exception as e:
+        run.log(f"rollback FAILED for {change.kind} {change.target_object}: {e}")
+        return False
+
+
+def _combo_regressions(
+    prev_scores: list[PlanScore], cur_scores: list[PlanScore], tolerance: float
+) -> list[str]:
+    """Per-combo regressions beyond tolerance vs. the previous iteration.
+
+    This is the verify gate the termination conditions promise: a change that
+    lifts the aggregate while tanking one combo is a regression, not a win."""
+    prev_by = {s.combo_label: s.score for s in prev_scores}
+    out = []
+    for s in cur_scores:
+        p = prev_by.get(s.combo_label)
+        if p is not None and p - s.score > tolerance:
+            out.append(
+                f"combo '{s.combo_label}' regressed {p:.1f} → {s.score:.1f} "
+                f"(drop {p - s.score:.1f} > tolerance {tolerance:.1f})"
+            )
+    return out
 
 
 # ---- the loop ---------------------------------------------------------------
@@ -97,6 +156,7 @@ def run_loop(
     regression_tolerance: float = 10.0,
     use_actual: bool = False,
     max_combos: int = 12,
+    auto_rollback: bool = True,
 ) -> list[IterationResult]:
     params, combos = discover.discover(cursor, proc_name, max_combos=max_combos)
     run.log(
@@ -104,9 +164,14 @@ def run_loop(
         + ", ".join(c.label or "default" for c in combos)
     )
     history: list[IterationResult] = []
+    attempts: list[AttemptRecord] = []
     current_proc = proc_name
+    prev_result: IterationResult | None = None   # last iteration kept (not rolled back)
+    pending_change: Change | None = None         # change applied after prev_result
+    pending_result: IterationResult | None = None  # iteration that applied it
     prev_aggregate = -1.0
     stall_streak = 0
+    version = 0
 
     for it in range(max_iterations):
         proc_def = get_proc_text(cursor, current_proc)
@@ -130,7 +195,7 @@ def run_loop(
             )
 
         agg = workload_score(scores, combos)
-        frac = fraction_good(scores, quality_threshold)
+        frac = fraction_good(scores, quality_threshold, combos)
 
         result = IterationResult(
             iteration=it, scores=scores, aggregate_score=agg, fraction_good=frac,
@@ -138,48 +203,122 @@ def run_loop(
         )
         run.log(f"[iter {it}] analyze · aggregate={agg:.1f} · {frac:.0%} of combos ≥ {quality_threshold:.0f}")
 
-        # termination: good enough
-        if frac >= target_fraction:
-            history.append(result)
-            run.log(f"[iter {it}] STOP — target met: {frac:.0%} good, agg={agg:.1f}")
-            break
+        # --- verify gate: did the change applied last iteration regress a combo? ---
+        regressed = False
+        if prev_result is not None and pending_change is not None:
+            regs = _combo_regressions(prev_result.scores, scores, regression_tolerance)
+            if regs:
+                regressed = True
+                result.regressions = regs
+                result.variant_invalidated = True
+                for r_msg in regs:
+                    run.log(f"[iter {it}] verify · {r_msg}")
+                _try_rollback(cursor, pending_change, run, "per-combo regression")
+                pending_result.change_rolled_back = True
+                attempts.append(AttemptRecord(
+                    iteration=pending_result.iteration,
+                    kind=pending_change.kind,
+                    target_object=pending_change.target_object,
+                    outcome="rolled_back",
+                    detail=f"aggregate {prev_result.aggregate_score:.1f} → {agg:.1f}; "
+                           + "; ".join(regs),
+                ))
+            elif pending_result is not None:
+                attempts.append(AttemptRecord(
+                    iteration=pending_result.iteration,
+                    kind=pending_change.kind,
+                    target_object=pending_change.target_object,
+                    outcome="kept",
+                    detail=f"aggregate {prev_result.aggregate_score:.1f} → {agg:.1f}",
+                ))
+        history.append(result)
+        pending_change = None
+        pending_result = None
 
-        # termination: stalled (require 2 consecutive no-improvement rounds)
-        if agg > prev_aggregate + 0.5:
-            stall_streak = 0
-        else:
+        if regressed:
+            # Revert the decision inputs to the last good variant — its scores
+            # still describe it accurately, so no re-capture is needed.
+            current_proc = prev_result.scored_proc
+            proc_def = prev_result.proc_def
+            scores = prev_result.scores
+            agg = prev_result.aggregate_score
+            frac = prev_result.fraction_good
             stall_streak += 1
+        else:
+            prev_result = result
+            # termination: good enough (only a non-regressed iteration counts)
+            if frac >= target_fraction:
+                run.log(f"[iter {it}] STOP — target met: {frac:.0%} good, agg={agg:.1f}")
+                break
+            # stall bookkeeping (2 consecutive no-improvement rounds stop the loop)
+            if agg > prev_aggregate + 0.5:
+                stall_streak = 0
+            else:
+                stall_streak += 1
+
         if it > 0 and stall_streak >= 2:
-            history.append(result)
             run.log(f"[iter {it}] STOP — stalled {stall_streak} consecutive round(s) "
                     f"(agg={agg:.1f} vs prev {prev_aggregate:.1f})")
             break
 
-        # decision step
-        change = backend.propose_change(proc_def, scores)
+        # --- decision step ---------------------------------------------------
+        # The sandbox is created BEFORE the decision so the model is told the
+        # exact object its apply_sql must target — it never guesses the name.
+        # Cloning from current_proc lets changes compound across iterations.
+        version += 1
+        sandbox = make_sandbox(cursor, current_proc, proc_name, version)
+        context = DecisionContext(sandbox_proc=sandbox, attempts=list(attempts))
+        change = backend.propose_change(proc_def, scores, context)
         if change.kind == "none" or not change.apply_sql.strip():
-            history.append(result)
+            drop_sandbox(cursor, sandbox)
             run.log(f"[iter {it}] STOP — no safe change proposed")
             break
         run.log(f"[iter {it}] decide · {change.kind} on {change.target_object}: {change.rationale}", echo=False)
 
-        # apply to a fresh sandbox, then verify next iteration
-        sandbox = make_sandbox(cursor, proc_name, it + 1)
+        # --- apply to the sandbox, verify next iteration ----------------------
         try:
-            for stmt in _split_batches(change.apply_sql):
-                if stmt.strip():
-                    cursor.execute(stmt)
+            _run_sql_batches(cursor, change.apply_sql)
         except Exception as e:
             result.regressions.append(f"apply failed: {e}")
-            history.append(result)
+            attempts.append(AttemptRecord(
+                iteration=it, kind=change.kind, target_object=change.target_object,
+                outcome="failed", detail=f"apply error: {e}",
+            ))
+            _try_rollback(cursor, change, run, "apply failed part-way")
+            drop_sandbox(cursor, sandbox)
             run.log(f"[iter {it}] apply FAILED on sandbox {sandbox}: {e}")
-            break
+            stall_streak += 1
+            if stall_streak >= 2:
+                run.log(f"[iter {it}] STOP — {stall_streak} consecutive failed round(s)")
+                break
+            continue
 
         result.change_applied = change
-        history.append(result)
+        pending_change = change
+        pending_result = result
         current_proc = sandbox
         prev_aggregate = agg
         run.log(f"[iter {it}] applied {change.kind}: {change.target_object} → sandbox {sandbox} (agg={agg:.1f})")
+
+    # --- end of run: undo every change that is not part of the winner ---------
+    # Changes recorded on iteration N produce the variant scored at N+1, so the
+    # winner's definition contains only changes from iterations strictly before
+    # it. Anything applied at/after the winning iteration (including a final,
+    # never-verified change) has real side effects — indexes especially — and
+    # is rolled back so the database ends the run carrying only the winner.
+    if auto_rollback and history:
+        candidates = [r for r in history if not r.variant_invalidated] or history
+        best = max(candidates, key=lambda r: r.aggregate_score)
+        losers = [
+            r for r in history
+            if r.change_applied and not r.change_rolled_back
+            and r.change_applied.kind != "none"
+            and r.iteration >= best.iteration
+        ]
+        for r in reversed(losers):
+            _try_rollback(cursor, r.change_applied, run,
+                          f"not part of winner (iter {best.iteration})")
+            r.change_rolled_back = True
 
     return history
 
@@ -220,9 +359,15 @@ def main(argv=None):
     ap.add_argument("--max-iterations", type=int, default=5)
     ap.add_argument("--target-fraction", type=float, default=0.8)
     ap.add_argument("--quality-threshold", type=float, default=75.0)
+    ap.add_argument("--regression-tolerance", type=float, default=10.0,
+                    help="max per-combo score drop a change may cause before it "
+                         "is rolled back (default 10)")
     ap.add_argument("--max-combos", type=int, default=12)
     ap.add_argument("--actual", action="store_true",
                     help="run ACTUAL plans (executes proc — non-prod only)")
+    ap.add_argument("--no-auto-rollback", action="store_true",
+                    help="keep every applied change on the database at end of run "
+                         "(default: changes not part of the winner are rolled back)")
     ap.add_argument("--out-dir", default="out",
                     help="base output dir; each run lands in "
                          "<out-dir>/<schema.proc>/<timestamp>/ (default: out)")
@@ -260,8 +405,10 @@ def main(argv=None):
             max_iterations=args.max_iterations,
             target_fraction=args.target_fraction,
             quality_threshold=args.quality_threshold,
+            regression_tolerance=args.regression_tolerance,
             use_actual=args.actual,
             max_combos=args.max_combos,
+            auto_rollback=not args.no_auto_rollback,
         )
 
         # End-of-run artifacts, all inside the run folder alongside the evidence.
@@ -393,10 +540,12 @@ def _render_timeline(history: list[IterationResult]) -> str:
     for r in history:
         if r.change_applied and r.change_applied.kind != "none":
             c = r.change_applied
-            dot = "applied"
+            dot = "failed" if r.change_rolled_back else "applied"
             head = f"{_esc(_kind_label(c.kind))}"
             if c.target_object:
                 head += f' <code>{_esc(c.target_object)}</code>'
+            if r.change_rolled_back:
+                head += ' <span class="muted">(rolled back)</span>'
             detail = _esc(c.rationale)
         elif r.regressions:
             dot = "failed"
@@ -462,6 +611,9 @@ def _render_iteration(r: IterationResult) -> str:
     ]
 
     if r.change_applied and r.change_applied.kind != "none":
+        if r.change_rolled_back:
+            parts.append('<p class="muted">The change below was <strong>rolled back</strong> — '
+                         'its verify pass regressed a combo, or it was not part of the winner.</p>')
         parts.append(_render_change(r.change_applied))
     else:
         parts.append('<p class="muted no-change">No change applied this iteration.</p>')
