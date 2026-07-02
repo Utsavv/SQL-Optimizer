@@ -40,6 +40,10 @@ class PlanCapture:
     # Raw SET STATISTICS IO / TIME text (actual mode only). This is the
     # human-readable IO-stat evidence the report links to alongside the plan.
     io_stats_text: Optional[str] = None
+    # Top session waits (wait_type -> ms) accumulated during the execution
+    # (actual mode only, best-effort) — shows whether the proc was CPU, IO, or
+    # lock bound, which the plan alone cannot.
+    wait_stats: Optional[dict] = None
 
 
 @dataclass

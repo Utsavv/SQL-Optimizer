@@ -55,7 +55,7 @@ def _run(tmp_path, monkeypatch, scripted_scores, backend, **kwargs):
     monkeypatch.setattr(optimize.discover, "discover",
                         lambda cursor, proc, max_combos=12: ([], combos))
     monkeypatch.setattr(optimize.capture, "capture_workload",
-                        lambda cursor, proc, combos, actual=False: [])
+                        lambda cursor, proc, combos, actual=False, runs=1: [])
     monkeypatch.setattr(optimize.analyze, "analyze_workload",
                         lambda caps: next(score_iter))
     monkeypatch.setattr(optimize, "get_proc_text",
@@ -181,7 +181,7 @@ def test_apply_failure_continues_with_failed_attempt(tmp_path, monkeypatch):
     monkeypatch.setattr(optimize.discover, "discover",
                         lambda cursor, proc, max_combos=12: ([], combos))
     monkeypatch.setattr(optimize.capture, "capture_workload",
-                        lambda cursor, proc, combos, actual=False: [])
+                        lambda cursor, proc, combos, actual=False, runs=1: [])
     monkeypatch.setattr(optimize.analyze, "analyze_workload",
                         lambda caps: next(score_iter))
     monkeypatch.setattr(optimize, "get_proc_text",

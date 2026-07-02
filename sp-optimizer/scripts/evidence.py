@@ -124,6 +124,7 @@ class RunDir:
                     "cpu_ms": score.cpu_ms,
                     "logical_reads": score.logical_reads,
                     "output_rows": score.output_rows,
+                    "top_waits_ms": cap.wait_stats,
                 },
                 "evidence": {"plan": plan_rel, "statistics": stats_rel},
             }

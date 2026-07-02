@@ -157,6 +157,7 @@ def run_loop(
     use_actual: bool = False,
     max_combos: int = 12,
     auto_rollback: bool = True,
+    runs_per_combo: int = 1,
 ) -> list[IterationResult]:
     params, combos = discover.discover(cursor, proc_name, max_combos=max_combos)
     run.log(
@@ -193,7 +194,8 @@ def run_loop(
         proc_def = get_proc_text(cursor, current_proc)
         mode = "actual" if use_actual else "estimated"
         run.log(f"[iter {it}] capture ({mode}) of {current_proc} across {len(combos)} combo(s)")
-        caps = capture.capture_workload(cursor, current_proc, combos, actual=use_actual)
+        caps = capture.capture_workload(cursor, current_proc, combos,
+                                        actual=use_actual, runs=runs_per_combo)
         scores = analyze.analyze_workload(caps)
 
         # Persist every piece of evidence for this iteration and link it onto
@@ -382,6 +384,13 @@ def main(argv=None):
     ap.add_argument("--max-combos", type=int, default=12)
     ap.add_argument("--actual", action="store_true",
                     help="run ACTUAL plans (executes proc — non-prod only)")
+    ap.add_argument("--runs", type=int, default=1,
+                    help="measured executions per combo in --actual mode (plus one "
+                         "discarded warm-up); medians are reported. Default 1 — "
+                         "use 3+ when timings matter")
+    ap.add_argument("--query-timeout", type=int, default=300,
+                    help="per-statement timeout in seconds (default 300) so a "
+                         "runaway full-history combo cannot hang the run")
     ap.add_argument("--no-auto-rollback", action="store_true",
                     help="keep every applied change on the database at end of run "
                          "(default: changes not part of the winner are rolled back)")
@@ -409,6 +418,7 @@ def main(argv=None):
         backend = LiteLLMBackend(model=args.model)
 
     conn = pyodbc.connect(args.conn, autocommit=True)
+    conn.timeout = args.query_timeout  # applies to every statement on this connection
     cursor = conn.cursor()
 
     # Each run gets its OWN folder: <out-dir>/<schema.proc>/<timestamp>/.
@@ -426,6 +436,7 @@ def main(argv=None):
             use_actual=args.actual,
             max_combos=args.max_combos,
             auto_rollback=not args.no_auto_rollback,
+            runs_per_combo=args.runs,
         )
 
         # End-of-run artifacts, all inside the run folder alongside the evidence.
