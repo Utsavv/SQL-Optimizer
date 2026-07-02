@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Post-setup verification: sa login and WideWorldImporters must be queryable.
+# Post-setup verification: confirm sa login and WideWorldImporters access.
 set -euo pipefail
 
 SA_PASSWORD='@ATISecure1'

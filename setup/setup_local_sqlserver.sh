@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Local SQL Server 2022 setup via Docker (Apple Silicon + Intel compatible)
-# Usage: bash setup_local_sqlserver.sh
+# Usage: bash setup_local_sqlserver.sh (from repo root or setup/)
 set -euo pipefail
 
 SA_PASSWORD='@ATISecure1'
