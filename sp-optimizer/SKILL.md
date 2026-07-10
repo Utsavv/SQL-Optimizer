@@ -61,11 +61,59 @@ The same flow applies to every proc — substitute the name and connection; noth
 4. **Run the loop.** Capture → analyze → decide → apply-to-sandbox → re-verify, until a termination condition is met.
 5. **Review outputs** under the run's output dir: the report, the applied changes + rollbacks, and the winning variant.
 
-### Typical entry point
+### Entry point — YOU (the agent) drive the steps
+
+**This is the recommended path when a coding agent is running the skill.** You
+are the decision-maker, so you do not need LiteLLM, an API key, or a pre-staged
+`FileBackend` decisions file. Instead, drive the loop one step at a time with
+`python -m scripts.session`: the deterministic engine runs discover / capture /
+analyze / apply for you, and **you make the single "smallest-safe change"
+decision yourself**, in your own reasoning, between `evaluate` and `apply`.
 
 ```bash
 # Run from the sp-optimizer/ subdirectory — it holds the scripts/ package.
 # (Running from the parent repo root fails: ModuleNotFoundError: No module named 'scripts'.)
+cd sp-optimizer
+
+# 1. DISCOVER — derive the workload and open a run. Prints the session path
+#    (session.json inside the run folder) + the combos. --conn defaults to
+#    SQL_CONNECTION_STRING (.env). Add --actual for runtime stats (non-prod only).
+python -m scripts.session discover --proc "<schema>.<your_proc>" \
+  --max-iterations 5 --target-fraction 0.8 --out-dir out
+
+# Then loop, using the printed session path (out/<schema.proc>/<timestamp>/session.json):
+
+# 2. EVALUATE — capture + analyze the current variant across the workload and
+#    persist evidence. Prints the analysis as JSON (per-combo scores, warnings,
+#    signals, the proc definition) and whether a termination condition is met.
+python -m scripts.session evaluate --session <session.json>
+
+# 3. DECIDE (you) — read that JSON, ground it in references/ + the decision-log
+#    cache (and Microsoft Learn MCP on a cache miss), and pick ONE smallest-safe
+#    change. Write it as {kind, rationale, apply_sql, rollback_sql,
+#    target_object} to a small JSON file. If "stop_suggested" is true, skip to 5.
+
+# 4. APPLY — apply your change to a fresh sandbox copy (<proc>_opt_v<n>), then
+#    go back to step 2 to re-verify. The live proc is never touched.
+python -m scripts.session apply --session <session.json> --change change.json
+
+# 5. FINISH — write report.html, winner.sql, changes.sql, manifest.json.
+python -m scripts.session finish --session <session.json>
+```
+
+Each step is its own process; the loop state (workload, current sandbox
+variant, iteration counter, per-iteration history) round-trips through
+`session.json` between commands, so you can reason freely between steps. `apply`
+takes exactly one change per call (mirroring the one-change-per-iteration
+discipline). Run `python -m scripts.session status --session <session.json>` at
+any time to see where the run stands.
+
+### Alternative entry point — the self-contained loop (in-process model)
+
+When **no agent** is in the loop (unattended / CI), `scripts.optimize` runs the
+whole thing in one process and calls a model itself through an `LLMBackend`:
+
+```bash
 cd sp-optimizer
 python -m scripts.optimize \
   --proc "<schema>.<your_proc>" \
@@ -73,41 +121,31 @@ python -m scripts.optimize \
   --max-iterations 5 \
   --target-fraction 0.8 \
   --out-dir out
-# Each run lands in out/<schema.proc>/<timestamp>/ with the report, run.log,
-# changes.sql, winner.sql, manifest.json, and the evidence/ folder.
 # --conn is read from SQL_CONNECTION_STRING (.env) if omitted.
 # --model defaults to LLM_MODEL (.env), or ollama_chat/gemma4 against a local
 # Ollama server (http://localhost:11434) if neither is set.
 # add --actual to capture runtime stats (executes the proc — non-prod only).
+# --backend file --decisions <path> replays pre-staged agent decisions (no key).
 ```
 
-PowerShell equivalent:
-
-```powershell
-# Run from the sp-optimizer/ subdirectory — it holds the scripts/ package.
-# (Running from the parent repo root fails: ModuleNotFoundError: No module named 'scripts'.)
-cd sp-optimizer
-python -m scripts.optimize `
-  --proc "<schema>.<your_proc>" `
-  --backend litellm --model "gemini/gemini-1.5-flash" `
-  --max-iterations 5 `
-  --target-fraction 0.8 `
-  --out-dir out
-```
+Both entry points produce the identical run folder (report, run.log,
+changes.sql, winner.sql, manifest.json, evidence/) — they differ only in *who
+makes the decision*.
 
 Walk through the modules in this order when reading or extending the code:
 1. `scripts/discover.py` — parameter discovery + data-derived workload (see `references/parameter-discovery.md`)
 2. `scripts/capture.py` — execution plan + runtime capture
 3. `scripts/analyze.py` — plan XML scoring (see `references/plan-analysis.md`)
-4. `scripts/optimize.py` — the orchestration loop + LLM decision step
-5. `scripts/llm.py` — pluggable LLM backend (any provider via LiteLLM, or replay); the decision prompt encodes the index discipline from `references/indexing-best-practices.md`
+4. `scripts/session.py` — the agent-driven step commands (discover/evaluate/apply/finish); the decision step is YOURS, no model in-process
+5. `scripts/optimize.py` — the self-contained orchestration loop + in-process LLM decision step
+6. `scripts/llm.py` — pluggable in-process LLM backend used only by `optimize.py` (any provider via LiteLLM, or `FileBackend` replay); the decision prompt encodes the index discipline from `references/indexing-best-practices.md`
 
 ## Decision grounding (Microsoft Learn MCP, cached)
 
-When the decision step (step 4) is driven by an interactive agent (e.g. via
-`--backend file` with Microsoft Learn MCP available — see `FileBackend` in
-`scripts/llm.py`), ground every proposed change in official guidance, but
-**check the cache before paying for a fresh lookup**:
+When the decision step (step 4) is driven by you, the agent — the
+`python -m scripts.session` flow above, or the legacy `--backend file` replay —
+ground every proposed change in official guidance, but **check the cache before
+paying for a fresh lookup**:
 
 1. **Read `references/decision-log.md` first.** Match the current finding
    (warning type, signal, or proposed change `kind`) against each entry's
@@ -126,9 +164,12 @@ This keeps token spend on MCP search/fetch calls limited to genuinely new
 questions instead of re-researching the same parameter-sniffing or
 indexing patterns on every run.
 
-## LLM backend
+## Who makes the decision (step 4)
 
-The decision step (step 4) is the only place an LLM is required. It is pluggable: `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with two implementations — `LiteLLMBackend` (default; routes to any provider — local Ollama, OpenAI, Anthropic, Gemini, Azure, Bedrock, etc. — via the `LLM_MODEL` env var / `--model` flag and the matching API key, no code change needed to switch; defaults to `ollama_chat/gemma4` against `http://localhost:11434` when unset) and `FileBackend` (`--backend file --decisions <path>`), which replays agent-made decisions from JSON when no model API key is available. The analysis and capture steps are deterministic and need no model.
+The decision step is the only place judgement is required; every other step is deterministic and needs no model. There are two ways to supply it:
+
+- **Agent-driven (`python -m scripts.session`)** — recommended when a coding agent is running the skill. *You* make the decision between `evaluate` and `apply`; there is no `LLMBackend`, no LiteLLM import, and no API key in the process. This is the flow in "Entry point — YOU (the agent) drive the steps" above.
+- **In-process backend (`scripts.optimize`)** — for unattended / CI runs with no agent. `scripts/llm.py` exposes a `propose_change(context) -> Change` interface with two implementations: `LiteLLMBackend` (default; routes to any provider — local Ollama, OpenAI, Anthropic, Gemini, Azure, Bedrock, etc. — via `LLM_MODEL` / `--model` + the matching API key; defaults to `ollama_chat/gemma4` against `http://localhost:11434` when unset) and `FileBackend` (`--backend file --decisions <path>`), which replays pre-staged agent decisions from JSON when no API key is available.
 
 The structured JSON prompt that drives the decision step lives in `scripts/llm.py` (`SYSTEM_PROMPT`) — it asks for a single, smallest-safe change plus rationale and a rollback, returned as strict JSON. None of it references any specific procedure, so it applies unchanged to whatever proc you target.
 

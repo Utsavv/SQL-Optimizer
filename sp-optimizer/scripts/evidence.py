@@ -57,15 +57,41 @@ class RunDir:
         self.timestamp = when
         self.stamp = when.strftime("%Y-%m-%d_%H%M%S")
         self.root = Path(base) / _proc_slug(proc_name) / self.stamp
-        self.evidence_root = self.root / "evidence"
+        self._bind_paths()
         self.evidence_root.mkdir(parents=True, exist_ok=True)
+        self._log_fh = open(self.log_path, "a", encoding="utf-8")
+        self.log(f"run start · proc={proc_name} · dir={self.root}")
+
+    def _bind_paths(self) -> None:
+        """Derive every artifact path from ``self.root`` (shared by __init__ and
+        reopen)."""
+        self.evidence_root = self.root / "evidence"
         self.report_path = self.root / "report.html"
         self.changes_path = self.root / "changes.sql"
         self.winner_path = self.root / "winner.sql"
         self.manifest_path = self.root / "manifest.json"
         self.log_path = self.root / "run.log"
+
+    @classmethod
+    def reopen(cls, root, proc_name: str) -> "RunDir":
+        """Rebind to an EXISTING run folder without creating a new timestamped
+        directory or emitting a fresh 'run start' line.
+
+        The step-by-step (agent-driven) driver runs each step as its own process,
+        so every command after ``discover`` must reattach to the run folder that
+        ``discover`` created and keep appending evidence + log lines to it."""
+        self = cls.__new__(cls)
+        self.root = Path(root)
+        self.proc_name = proc_name
+        self.stamp = self.root.name
+        try:
+            self.timestamp = datetime.strptime(self.stamp, "%Y-%m-%d_%H%M%S")
+        except ValueError:
+            self.timestamp = datetime.now()
+        self._bind_paths()
+        self.evidence_root.mkdir(parents=True, exist_ok=True)
         self._log_fh = open(self.log_path, "a", encoding="utf-8")
-        self.log(f"run start · proc={proc_name} · dir={self.root}")
+        return self
 
     # ---- logging ------------------------------------------------------------
 

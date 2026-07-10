@@ -134,7 +134,7 @@ common levers it exposes:
   (default 80%) and a max iteration count (default 5).
 - **Estimated vs actual** — estimated plans are read-only and the default; ask
   for *actual* runtime stats only against non-prod, since that executes the proc.
-- **Which LLM backend** — any provider via [LiteLLM](https://docs.litellm.ai/docs/providers) (OpenAI, Anthropic, Gemini, Azure, Bedrock, ...), or a replay/file backend.
+- **Who decides** — the agent itself, step-by-step, via `python -m scripts.session` (no API key); or an in-process model via any provider through [LiteLLM](https://docs.litellm.ai/docs/providers) (OpenAI, Anthropic, Gemini, Azure, Bedrock, ...); or a replay/file backend.
 
 ## How the Python code powers the skill
 
@@ -147,8 +147,9 @@ offline.
 | `scripts/discover.py` | Discover | parameter space → workload combos, **auto-derived from the proc's real data** (`derive_combos_from_data`) | no |
 | `scripts/capture.py` | Capture | execution plan + runtime capture | no |
 | `scripts/analyze.py` | Analyze | deterministic plan-XML scoring | no |
-| `scripts/llm.py` | Decide | propose one safe change as strict JSON; pluggable LiteLLM / file backend | **yes** |
-| `scripts/optimize.py` | Apply + Verify | the loop + sandbox management + CLI + report | no |
+| `scripts/session.py` | Decide (agent-driven) | step-by-step CLI (`discover`/`evaluate`/`apply`/`finish`) so a coding agent makes the decision itself — no in-process model | no |
+| `scripts/llm.py` | Decide (in-process) | propose one safe change as strict JSON; pluggable LiteLLM / file backend, used only by `optimize.py` | **yes** |
+| `scripts/optimize.py` | Apply + Verify | the self-contained loop + sandbox management + CLI + report | no |
 | `scripts/evidence.py` | Capture + Verify | writes per-combo plan XML / IO stats / score JSON into each run's `evidence/` folder | no |
 | `scripts/models.py` | all steps | shared dataclasses for combos, plans, scores, decisions | no |
 
@@ -230,20 +231,33 @@ subscription. Those subscriptions power the chat products (claude.ai,
 chatgpt.com) and don't expose a programmatic endpoint LiteLLM can call, so they
 can't be dropped in where an API key is expected.
 
-To drive the decision step from a subscription instead of a paid API key, use
-the **`FileBackend`** path (no API key required):
+So if you drive the optimizer from a coding agent (Claude Code, Codex) under
+your subscription, you **don't need LiteLLM or an API key at all**. There are
+two no-key paths, both letting the agent make the "propose one smallest-safe
+change" decision:
 
-1. Run an external agent under your subscription — e.g. **Claude Code**, which
-   supports Claude Pro/Max login — and have it make the "propose one
-   smallest-safe change" decisions.
-2. Write those decisions to a JSON file in the same shape `LiteLLMBackend`
-   emits (a JSON array of `{kind, rationale, apply_sql, rollback_sql,
-   target_object}` objects).
-3. Point the loop at it: `--backend file --decisions <path>`. `FileBackend`
-   replays each staged decision in order — zero per-token API billing.
+- **Agent-driven step commands (recommended) — `python -m scripts.session`.**
+  The agent runs the deterministic steps and makes the decision *inline*,
+  reacting to each iteration's verification. No model runs in-process, no
+  decisions file to pre-stage:
+  ```bash
+  cd sp-optimizer
+  python -m scripts.session discover --proc "<schema>.<proc>"      # derive workload, open a run
+  python -m scripts.session evaluate --session <session.json>      # capture+analyze → prints the analysis
+  # the agent reads that analysis and writes its ONE change to change.json, then:
+  python -m scripts.session apply --session <session.json> --change change.json
+  # loop evaluate → apply until done, then:
+  python -m scripts.session finish --session <session.json>        # report + winner + manifest
+  ```
+- **`FileBackend` replay — `--backend file --decisions <path>`.** For feeding
+  the *self-contained* `scripts.optimize` loop a batch of decisions the agent
+  staged up front, as a JSON array of `{kind, rationale, apply_sql,
+  rollback_sql, target_object}` objects. Simpler to wire into the existing loop,
+  but the decisions must all be written before any is applied.
 
-In short: in-process LLM call → needs an API key (`LiteLLMBackend`); external
-subscription-backed agent → no key (`FileBackend`).
+In short: unattended in-process call → needs an API key (`LiteLLMBackend`);
+agent under a subscription → no key — drive it step-by-step with
+`scripts.session` (decide inline) or replay a staged file (`FileBackend`).
 
 ## Why this is different from existing tools
 
