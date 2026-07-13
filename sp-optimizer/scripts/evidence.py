@@ -26,6 +26,7 @@ left only in memory.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -139,12 +140,24 @@ class RunDir:
     # ---- logging ------------------------------------------------------------
 
     def log(self, msg: str, echo: bool = True) -> None:
-        """Append a timestamped line to run.log (and, by default, the console)."""
-        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  {msg}"
+        """Append a timestamped line to run.log (and, by default, the console).
+
+        Each line is tagged with the ``.py`` file that originated the entry so
+        the run log makes clear which script produced each message."""
+        source = self._caller_source()
+        line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  [{source}]  {msg}"
         self._log_fh.write(line + "\n")
         self._log_fh.flush()
         if echo:
             _safe_console_print(msg)
+
+    @staticmethod
+    def _caller_source() -> str:
+        """Return the basename of the ``.py`` file that invoked ``log`` — the
+        code that actually generated the entry. Frame 0 is this helper, frame 1
+        is ``log`` itself, so frame 2 is the caller."""
+        frame = sys._getframe(2)
+        return os.path.basename(frame.f_code.co_filename)
 
     # ---- per-combo evidence -------------------------------------------------
 
