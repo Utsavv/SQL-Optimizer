@@ -27,11 +27,54 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from .models import Change, IterationResult, PlanCapture, PlanScore
+
+
+# Transliterations for the handful of non-ASCII glyphs the loop echoes. Used
+# only for the CONSOLE fallback on terminals that can't encode them (e.g. a
+# Windows cp1252 PowerShell); run.log always keeps the original Unicode.
+_CONSOLE_ASCII = {
+    "·": "-",
+    "≥": ">=",
+    "≤": "<=",
+    "—": "--",
+    "–": "-",
+    "→": "->",
+    "×": "x",
+    "…": "...",
+}
+
+
+def _ascii_fallback(msg: str) -> str:
+    """Best-effort ASCII rendering of ``msg`` for a console that can't encode
+    it: map the known glyphs to readable equivalents, then replace anything
+    still non-ASCII so the print can never raise."""
+    for uni, ascii_ in _CONSOLE_ASCII.items():
+        msg = msg.replace(uni, ascii_)
+    return msg.encode("ascii", "replace").decode("ascii")
+
+
+def _safe_console_print(msg: str) -> None:
+    """``print(msg)`` that never crashes on a non-UTF-8 console.
+
+    On a cp1252 (or otherwise limited) Windows terminal, ``print`` of a string
+    containing e.g. ``≥`` raises ``UnicodeEncodeError`` even though the run
+    itself succeeded. We degrade the CONSOLE echo to an ASCII-safe equivalent
+    in that case; the full Unicode text is still written to run.log."""
+    try:
+        print(msg)
+    except UnicodeEncodeError:
+        safe = _ascii_fallback(msg)
+        try:
+            print(safe)
+        except UnicodeEncodeError:
+            enc = getattr(sys.stdout, "encoding", None) or "ascii"
+            print(safe.encode(enc, "replace").decode(enc, "replace"))
 
 
 def _slug(text: str, fallback: str = "item") -> str:
@@ -101,7 +144,7 @@ class RunDir:
         self._log_fh.write(line + "\n")
         self._log_fh.flush()
         if echo:
-            print(msg)
+            _safe_console_print(msg)
 
     # ---- per-combo evidence -------------------------------------------------
 
