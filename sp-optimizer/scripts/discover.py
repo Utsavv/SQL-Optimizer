@@ -64,8 +64,7 @@ SELECT p.name              AS param_name,
        t.name              AS type_name,
        p.max_length        AS max_length,
        p.is_output         AS is_output,
-       p.has_default_value AS has_default,
-       p.default_value     AS default_value
+       p.has_default_value AS has_default
 FROM sys.parameters p
 JOIN sys.types t ON p.user_type_id = t.user_type_id
 WHERE p.object_id = OBJECT_ID(?)
@@ -74,6 +73,9 @@ ORDER BY p.parameter_id;
 
 
 def get_signature(cursor, proc_name: str) -> list[ProcParam]:
+    # p.default_value is sql_variant; pyodbc can't fetch it directly (ODBC SQL
+    # type -150), and only has_default_value is needed for optional-parameter
+    # detection, so it's deliberately left out of SIGNATURE_SQL.
     cursor.execute(SIGNATURE_SQL, proc_name)
     params: list[ProcParam] = []
     for row in cursor.fetchall():
@@ -81,14 +83,13 @@ def get_signature(cursor, proc_name: str) -> list[ProcParam]:
         if row.type_name in ("varchar", "nvarchar", "char", "nchar"):
             type_disp = f"{row.type_name}({row.max_length})"
         has_default = bool(getattr(row, "has_default", False))
-        default_val = getattr(row, "default_value", None)
         params.append(
             ProcParam(
                 name=row.param_name,
                 sql_type=type_disp,
                 is_output=bool(row.is_output),
                 has_default=has_default,
-                default=None if default_val is None else str(default_val),
+                default=None,
             )
         )
     return params
