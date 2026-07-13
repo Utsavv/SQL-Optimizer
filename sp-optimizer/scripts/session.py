@@ -48,13 +48,14 @@ try:
 except ImportError:
     pass
 
-from . import analyze, capture, discover
+from . import analyze, capture, discover, eligibility
 from .evidence import RunDir
 from .models import (
     Change,
     IterationResult,
     ParamCombo,
     PlanScore,
+    decide_termination,
     fraction_good,
     workload_score,
 )
@@ -81,18 +82,23 @@ SESSION_VERSION = 1
 # holds in memory.
 
 def _combo_to_dict(c: ParamCombo) -> dict:
-    return {"values": c.values, "label": c.label, "weight": c.weight}
+    return {"values": c.values, "label": c.label, "weight": c.weight,
+            "status": c.status, "status_reason": c.status_reason}
 
 
 def _combo_from_dict(d: dict) -> ParamCombo:
     return ParamCombo(values=d["values"], label=d.get("label", ""),
-                      weight=float(d.get("weight", 1.0)))
+                      weight=float(d.get("weight", 1.0)),
+                      status=d.get("status", eligibility.OK),
+                      status_reason=d.get("status_reason", ""))
 
 
 def _score_to_dict(s: PlanScore) -> dict:
     return {
         "combo_label": s.combo_label,
         "score": s.score,
+        "status": s.status,
+        "status_reason": s.status_reason,
         "warnings": s.warnings,
         "missing_indexes": s.missing_indexes,
         "signals": s.signals,
@@ -109,6 +115,8 @@ def _score_from_dict(d: dict) -> PlanScore:
     return PlanScore(
         combo_label=d["combo_label"],
         score=d["score"],
+        status=d.get("status", "analyzed"),
+        status_reason=d.get("status_reason", ""),
         warnings=list(d.get("warnings", [])),
         missing_indexes=list(d.get("missing_indexes", [])),
         signals=dict(d.get("signals", {})),
@@ -245,6 +253,11 @@ class Session:
 
 # ---- step logic (engine calls; no model) -----------------------------------
 
+def _allow_empty() -> bool:
+    """Opt-in for intentionally empty-workload tests (SP_OPT_ALLOW_EMPTY=1)."""
+    return os.environ.get("SP_OPT_ALLOW_EMPTY", "").strip().lower() in ("1", "true", "yes")
+
+
 def do_evaluate(session: Session, cursor) -> dict:
     """Capture + analyze the current variant, persist evidence, append the
     iteration, and decide whether a termination condition is met.
@@ -271,11 +284,55 @@ def do_evaluate(session: Session, cursor) -> dict:
 
     proc_def = get_proc_text(cursor, session.current_proc)
     mode = "actual" if use_actual else "estimated"
+    timeout = cfg.get("command_timeout", capture.DEFAULT_COMMAND_TIMEOUT)
+
+    # A discovery-time precondition blocks the whole run: do NOT execute the
+    # workload (the proc may be an unbounded generator, need setup, or lack a
+    # server feature). Record a truthful blocked iteration and stop.
+    proc_block = cfg.get("proc_block")
+    if proc_block is not None:
+        proc_block = tuple(proc_block)  # round-tripped as a JSON list
+    if use_actual and proc_block is not None:
+        result = IterationResult(
+            iteration=it, scores=[], aggregate_score=0.0, fraction_good=0.0,
+            scored_proc=session.current_proc, proc_def=proc_def,
+        )
+        session.history.append(result)
+        term, _ = decide_termination(
+            it, [], 0.0, 0.0, target_fraction=target_fraction,
+            max_iterations=max_iterations, prev_aggregate=session.prev_aggregate,
+            stall_streak=session.stall_streak, use_actual=use_actual,
+            allow_empty=_allow_empty(), proc_block=proc_block,
+        )
+        session.awaiting_apply = False
+        session.save()
+        run.log(f"[iter {it}] BLOCKED [{term.terminal_status}] — {term.note}")
+        run.close()
+        return {
+            "iteration": it,
+            "scored_proc": session.current_proc,
+            "aggregate_score": 0.0,
+            "fraction_good": 0.0,
+            "stop_suggested": True,
+            "stop_reason": term.reason,
+            "terminal_status": term.terminal_status,
+            "eligible_for_apply": False,
+            "representative_workload": False,
+            "eligibility_note": term.note,
+            "next_step": "finish",
+            "next_sandbox": None,
+            "procedure_definition": proc_def,
+            "combos": [],
+        }
+
     run.log(f"[iter {it}] capture ({mode}) of {session.current_proc} "
             f"across {len(session.combos)} combo(s)")
-    caps = capture.capture_workload(cursor, session.current_proc, session.combos, actual=use_actual)
+    caps = capture.capture_workload(
+        cursor, session.current_proc, session.combos, actual=use_actual, timeout=timeout)
     scores = analyze.analyze_workload(caps)
 
+    # Persist evidence incrementally so an interrupted evaluation is immediately
+    # reportable (nothing depends on a later step to flush the per-combo record).
     for ordinal, (cap, score) in enumerate(zip(caps, scores)):
         plan_rel, stats_rel = run.write_evidence(it, ordinal, cap, score)
         score.plan_path = plan_rel
@@ -291,34 +348,40 @@ def do_evaluate(session: Session, cursor) -> dict:
     run.log(f"[iter {it}] analyze · aggregate={agg:.1f} · "
             f"{frac:.0%} of combos ≥ {quality_threshold:.0f}")
 
-    # --- termination (mirrors optimize.run_loop) ---
-    stop_reason = None
-    if frac >= target_fraction:
-        stop_reason = "target_met"
-    else:
-        if agg > session.prev_aggregate + 0.5:
-            session.stall_streak = 0
-        else:
-            session.stall_streak += 1
-        if it > 0 and session.stall_streak >= 2:
-            stop_reason = "stalled"
-        elif it + 1 >= max_iterations:
-            # No verify step remains after another apply — stop here.
-            stop_reason = "max_iterations"
+    # --- termination + eligibility gate (shared with optimize.run_loop) ---
+    proc_block = cfg.get("proc_block")
+    if proc_block is not None:
+        proc_block = tuple(proc_block)  # round-tripped as a JSON list
+    term, session.stall_streak = decide_termination(
+        it, scores, agg, frac,
+        target_fraction=target_fraction,
+        max_iterations=max_iterations,
+        prev_aggregate=session.prev_aggregate,
+        stall_streak=session.stall_streak,
+        use_actual=use_actual,
+        allow_empty=_allow_empty(),
+        proc_block=proc_block,
+    )
     session.prev_aggregate = agg
-    session.awaiting_apply = stop_reason is None
+    session.awaiting_apply = term.eligible_for_apply
     session.save()
 
-    if stop_reason:
-        run.log(f"[iter {it}] STOP suggested — {stop_reason} "
-                f"(agg={agg:.1f}, {frac:.0%} good)")
+    if term.stop:
+        run.log(f"[iter {it}] STOP suggested — {term.reason} "
+                f"[{term.terminal_status}] (agg={agg:.1f}, {frac:.0%} good)"
+                + (f" — {term.note}" if term.note else ""))
     run.close()
 
     # The sandbox name the NEXT `apply` will create is deterministic; surface it
     # so a rewrite/recompile change can target it by name in its apply_sql
     # (e.g. ALTER PROCEDURE <next_sandbox> ... OPTION (RECOMPILE)).
     schema, short = _split_schema_proc(session.proc)
-    next_sandbox = None if stop_reason else f"{schema}.{short}_opt_v{it + 1}"
+    next_sandbox = f"{schema}.{short}_opt_v{it + 1}" if term.eligible_for_apply else None
+
+    if term.eligible_for_apply:
+        next_step = "apply (propose one smallest-safe change) or finish"
+    else:
+        next_step = "finish"
 
     return {
         "iteration": it,
@@ -327,15 +390,21 @@ def do_evaluate(session: Session, cursor) -> dict:
         "fraction_good": round(frac, 4),
         "quality_threshold": quality_threshold,
         "target_fraction": target_fraction,
-        "stop_suggested": stop_reason is not None,
-        "stop_reason": stop_reason,
-        "next_step": "finish" if stop_reason else "apply (propose one smallest-safe change) or finish",
+        "stop_suggested": term.stop,
+        "stop_reason": term.reason,
+        "terminal_status": term.terminal_status,
+        "eligible_for_apply": term.eligible_for_apply,
+        "representative_workload": term.representative,
+        "eligibility_note": term.note,
+        "next_step": next_step,
         "next_sandbox": next_sandbox,
         "procedure_definition": proc_def,
         "combos": [
             {
                 "combo": s.combo_label,
                 "score": round(s.score, 1),
+                "status": s.status,
+                "status_reason": s.status_reason,
                 "warnings": s.warnings,
                 "missing_indexes": s.missing_indexes,
                 "signals": s.signals,
@@ -488,7 +557,7 @@ def _cmd_discover(args) -> int:
     if not conn:
         raise SystemExit("--conn is required (or set SQL_CONNECTION_STRING in .env)")
     _, cursor = _connect(conn)
-    params, combos = discover.discover(cursor, args.proc, max_combos=args.max_combos)
+    params, combos, proc_block = discover.discover(cursor, args.proc, max_combos=args.max_combos)
     run = RunDir(args.out_dir, args.proc)
     config = {
         "target_fraction": args.target_fraction,
@@ -497,21 +566,31 @@ def _cmd_discover(args) -> int:
         "regression_tolerance": args.regression_tolerance,
         "use_actual": args.actual,
         "max_combos": args.max_combos,
+        "command_timeout": args.command_timeout,
+        # A discovery-time precondition (missing feature, required setup, TVP /
+        # secret / structured input) that blocks the whole actual-plan run.
+        "proc_block": list(proc_block) if proc_block else None,
     }
     session = Session.create(run, args.proc, combos, config)
     run.log(f"discover · {len(params)} param(s), {len(combos)} workload combo(s): "
             + ", ".join(c.label or "default" for c in combos))
+    if proc_block:
+        run.log(f"discover · PRECONDITION [{proc_block[0]}]: {proc_block[1]}")
     run.close()
     _emit({
         "session": str(session.path),
         "run_folder": str(run.root),
         "proc": args.proc,
         "params": [{"name": p.name, "type": p.sql_type,
-                    "has_default": p.has_default, "is_output": p.is_output}
+                    "has_default": p.has_default, "is_output": p.is_output,
+                    "is_table_type": p.is_table_type, "is_sensitive": p.is_sensitive}
                    for p in params],
-        "combos": [{"label": c.label or "default", "values": c.values, "weight": c.weight}
+        "precondition": {"status": proc_block[0], "reason": proc_block[1]} if proc_block else None,
+        "combos": [{"label": c.label or "default", "values": c.values, "weight": c.weight,
+                    "status": c.status, "status_reason": c.status_reason}
                    for c in combos],
-        "next_step": "evaluate --session <session> --conn <conn>",
+        "next_step": ("finish (blocked by a precondition — no representative workload)"
+                      if proc_block else "evaluate --session <session> --conn <conn>"),
     })
     return 0
 
@@ -579,6 +658,9 @@ def main(argv=None) -> int:
     d.add_argument("--quality-threshold", type=float, default=75.0)
     d.add_argument("--regression-tolerance", type=float, default=10.0)
     d.add_argument("--max-combos", type=int, default=12)
+    d.add_argument("--command-timeout", type=int, default=capture.DEFAULT_COMMAND_TIMEOUT,
+                   help="per-combo ACTUAL-capture command timeout in seconds "
+                        "(0 disables); a runaway call is cancelled when it trips")
     d.add_argument("--actual", action="store_true",
                    help="run ACTUAL plans (executes proc — non-prod only)")
     d.set_defaults(func=_cmd_discover)

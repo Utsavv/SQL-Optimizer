@@ -194,6 +194,8 @@ class RunDir:
                 "values": cap.combo.values,
                 "weight": cap.combo.weight,
                 "score": round(score.score, 2),
+                "status": score.status,
+                "status_reason": score.status_reason,
                 "warnings": score.warnings,
                 "missing_indexes": score.missing_indexes,
                 "signals": score.signals,
@@ -293,6 +295,8 @@ class RunDir:
                 {
                     "combo": s.combo_label,
                     "score": round(s.score, 2),
+                    "status": s.status,
+                    "status_reason": s.status_reason,
                     "warnings": s.warnings,
                     "plan": s.plan_path,
                     "statistics": s.stats_path,

@@ -17,12 +17,14 @@ of arguments performs badly for others.
 | Path | What it is |
 |---|---|
 | `sp-optimizer/` | The optimizer itself: `SKILL.md` (the skill definition), `scripts/` (the Python engine), `references/` (grounding docs used at the decision step), `examples/worldwideimporters/` (one worked run, including `RUN-LOG.md`), `out/` (per-run output, git-ignored) |
-| `.claude/skills/sp-optimizer` | Symlink into `sp-optimizer/` so Claude Code auto-discovers the skill from this repo |
+| `.claude/skills/sp-optimizer/SKILL.md` | Real, committed copy of `sp-optimizer/SKILL.md` so Claude Code auto-discovers the skill deterministically on **every** platform (see [Repository-local skill discovery](#repository-local-skill-discovery)). Kept byte-identical to the canonical file by `setup/sync_skill.py` |
 | `workload-drivers/` | Headless load generators that put a heavy concurrent OLTP workload on WideWorldImporters (order-entry and vehicle-location inserts), so you can assess stored-procedure performance *under load*. Cross-platform Python ports of Microsoft's `wide-world-importers/workload-drivers` sample |
 | `setup/` | One-time environment bootstrap scripts — provision/load a test database, verify connectivity, roll back an optimizer run. Not needed if you already have a SQL Server to point the optimizer at |
 | `setup/deploy_wwi_free.sh` | Provisions a **new** Azure SQL Database (free tier) and loads the WorldWideImporters sample DB into it |
 | `setup/deploy_wwi_existing.sh` | Loads WorldWideImporters into an **existing** Azure SQL Server via `sqlpackage` |
 | `setup/test_connection.py` | Quick connectivity check against `SQL_CONNECTION_STRING` from `.env` |
+| `setup/Restore-WideWorldImporters.ps1` | Repeatable WideWorldImporters restore that recovers a database left in `RESTORING`/`SINGLE_USER` state instead of aborting on it (Pester tests alongside it) |
+| `setup/sync_skill.py` | Keeps `.claude/skills/sp-optimizer/SKILL.md` byte-identical to the canonical `sp-optimizer/SKILL.md`; `verify` proves the resolved path + hash |
 | `setup/CLEANUP.sql` | Rollback script — drops every sandbox object (`<proc>_opt_v<n>` clones, added indexes) an optimizer run created |
 | `requirements.txt` | Python deps: `pyodbc`, `python-dotenv`, `litellm` |
 | `.env.example` | Template for `SQL_CONNECTION_STRING` and the LLM backend config — copy to `.env` and fill in |
@@ -306,6 +308,37 @@ memory.
 reference (a covering index + `OPTION (RECOMPILE)`). It's illustrative only —
 not required to run the skill against your own proc.
 
+## Repository-local skill discovery
+
+Claude Code discovers a repo's skills from `.claude/skills/<name>/SKILL.md`. That
+entry used to be a **git symlink** into `sp-optimizer/`. Symlinks are not reliably
+materialized on a Windows checkout: without Developer Mode or
+`git config core.symlinks true`, git writes an 18-byte *text file* containing the
+link target (`../../sp-optimizer`) instead of a real link, so natural-language
+invocation could fail repo-local discovery or silently fall back to some other
+skill source in the runtime — the checked-out repository was not guaranteed to be
+what actually ran.
+
+To make discovery deterministic on **every** platform, `.claude/skills/sp-optimizer/SKILL.md`
+is now a **real, committed file** — no symlink semantics — kept byte-identical to
+the canonical `sp-optimizer/SKILL.md`:
+
+- **Unix and Windows, clean checkout:** the real file is present immediately; no
+  setup, no symlink support required.
+- **After editing the canonical `sp-optimizer/SKILL.md`:** run
+  `python setup/sync_skill.py sync` to refresh the copy (an explicit action — the
+  script only ever writes inside this repo's `.claude/skills`, never a globally
+  installed `~/.claude/skills`).
+- **Verify** the discovered skill resolves to this repo's definition:
+
+  ```bash
+  python setup/sync_skill.py verify   # exit 0 iff hashes match; prints the path
+  python setup/sync_skill.py path     # prints both resolved paths + sha256
+  ```
+
+  A pytest drift-guard (`sp-optimizer/tests/test_skill_discovery.py`) fails CI if
+  the two files ever diverge or the discovery entry regresses to a symlink.
+
 ## Reference material
 
 - `sp-optimizer/references/` — grounding docs the LLM decision step is checked
@@ -320,12 +353,53 @@ not required to run the skill against your own proc.
   score 73.0 → 98.8, logical reads on the narrow 1-day incremental pull
   2,401 → 7).
 
+## Workload eligibility & value validity
+
+Before drawing any conclusion about a procedure's *plan*, the skill checks that
+the generated workload is actually **valid** and **representative**. A great many
+call failures are not performance problems and must never be scored as bad plans
+or trigger an optimization. `scripts/eligibility.py` is the single generic place
+these are recognized (no procedure-specific constants); the outcome is a
+non-plan *status* carried through discovery → capture → analysis → termination:
+
+- **Type-aware values** — synthesized numerics respect the declared range
+  (`tinyint` 0..255, `decimal(p,s)` precision/scale, …); a value that can't fit
+  its type is a discovery defect (`invalid_input`), not a plan score.
+- **Cross-parameter validity** — independently-real values that form an invalid
+  call together (a role name and user name that collide, a special/fixed
+  principal) → `requires_curated_workload`.
+- **Table-valued & structured params** — TVPs and JSON/XML payloads that can't
+  be a scalar literal → `requires_curated_workload` (supply a fixture via
+  `SP_OPT_COMBOS`).
+- **Secrets** — password/token/key params are never mined from data, are
+  redacted from every artifact, and need a caller-supplied value
+  (`requires_sensitive_input`).
+- **Server prerequisites** — a Full-Text-dependent proc on a server without the
+  component → `blocked_prerequisite`; the shared failure short-circuits the rest
+  of the workload.
+- **Lifecycle & cost** — paired setup/teardown procs → `requires_setup`;
+  unbounded bulk generators require `SP_OPT_ALLOW_BULK=1` and run under a
+  per-combo command timeout (`--command-timeout`, default 120s) that cancels a
+  runaway call.
+- **Workload representativeness** — an all-empty actual workload can no longer
+  report `target_met`; opt in with `SP_OPT_ALLOW_EMPTY=1` for an intentionally
+  empty-workload test.
+- **Capture validity** — a capture that produced no plan is `capture_failed` /
+  `not_analyzable`, distinct from a score of zero, and never asks the agent to
+  change the proc.
+
+Environment opt-ins: `SP_OPT_COMBOS` (curated workload/fixture),
+`SP_OPT_ALLOW_BULK`, `SP_OPT_ALLOW_EMPTY`, `SP_OPT_SETUP_SQL` /
+`SP_OPT_TEARDOWN_SQL` (setup/teardown contract).
+
 ## Status
 
-Scaffold / v0. The deterministic pipeline (discover + analyze) is tested
-offline, including the data-derived workload generator (`derive_combos_from_data`)
-that makes the skill generic across procedures. The DB-facing steps need a live
-SQL Server to exercise. Mining concrete argument values from Query Store and
-mapping more predicate shapes (multi-column, function-wrapped) are the next
-enhancements.
+Scaffold / v0. The deterministic pipeline (discover, analyze, eligibility
+classification, and the termination/workload-quality gate) is covered by an
+offline pytest suite under `sp-optimizer/tests/` (no SQL Server required — mock
+cursors + sample plan XML). The data-derived workload generator
+(`derive_combos_from_data`) makes the skill generic across procedures. The
+DB-facing steps still need a live SQL Server to exercise end to end. Mining
+concrete argument values from Query Store and mapping more predicate shapes
+(multi-column, function-wrapped) are the next enhancements.
 </content>

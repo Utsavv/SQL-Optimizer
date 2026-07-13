@@ -27,9 +27,14 @@ from .llm import FileBackend, LiteLLMBackend, LLMBackend
 from .models import (
     Change,
     IterationResult,
+    decide_termination,
     fraction_good,
     workload_score,
 )
+
+
+def _allow_empty() -> bool:
+    return os.environ.get("SP_OPT_ALLOW_EMPTY", "").strip().lower() in ("1", "true", "yes")
 
 
 # ---- sandbox management -----------------------------------------------------
@@ -97,8 +102,9 @@ def run_loop(
     regression_tolerance: float = 10.0,
     use_actual: bool = False,
     max_combos: int = 12,
+    command_timeout: int = capture.DEFAULT_COMMAND_TIMEOUT,
 ) -> list[IterationResult]:
-    params, combos = discover.discover(cursor, proc_name, max_combos=max_combos)
+    params, combos, proc_block = discover.discover(cursor, proc_name, max_combos=max_combos)
     run.log(
         f"discover · {len(params)} param(s), {len(combos)} workload combo(s): "
         + ", ".join(c.label or "default" for c in combos)
@@ -108,11 +114,30 @@ def run_loop(
     prev_aggregate = -1.0
     stall_streak = 0
 
+    # A discovery-time precondition (missing feature, required setup, TVP /
+    # secret / structured input, unbounded generator) blocks the whole actual
+    # run before any execution — record it truthfully and stop.
+    if use_actual and proc_block is not None:
+        proc_def = get_proc_text(cursor, current_proc)
+        term, _ = decide_termination(
+            0, [], 0.0, 0.0, target_fraction=target_fraction,
+            max_iterations=max_iterations, prev_aggregate=prev_aggregate,
+            stall_streak=stall_streak, use_actual=use_actual,
+            allow_empty=_allow_empty(), proc_block=proc_block,
+        )
+        history.append(IterationResult(
+            iteration=0, scores=[], aggregate_score=0.0, fraction_good=0.0,
+            scored_proc=current_proc, proc_def=proc_def,
+        ))
+        run.log(f"[iter 0] BLOCKED [{term.terminal_status}] — {term.note}")
+        return history
+
     for it in range(max_iterations):
         proc_def = get_proc_text(cursor, current_proc)
         mode = "actual" if use_actual else "estimated"
         run.log(f"[iter {it}] capture ({mode}) of {current_proc} across {len(combos)} combo(s)")
-        caps = capture.capture_workload(cursor, current_proc, combos, actual=use_actual)
+        caps = capture.capture_workload(
+            cursor, current_proc, combos, actual=use_actual, timeout=command_timeout)
         scores = analyze.analyze_workload(caps)
 
         # Persist every piece of evidence for this iteration and link it onto
@@ -124,7 +149,7 @@ def run_loop(
             note = "ok" if not cap.error else f"ERROR: {cap.error}"
             run.log(
                 f"[iter {it}]   combo '{cap.combo.label or 'default'}' "
-                f"score={score.score:.1f} plan={plan_rel or '—'} "
+                f"score={score.score:.1f} [{score.status}] plan={plan_rel or '—'} "
                 f"stats={stats_rel or '—'} ({note})",
                 echo=False,
             )
@@ -138,21 +163,28 @@ def run_loop(
         )
         run.log(f"[iter {it}] analyze · aggregate={agg:.1f} · {frac:.0%} of combos ≥ {quality_threshold:.0f}")
 
-        # termination: good enough
-        if frac >= target_fraction:
+        # termination + eligibility gate (shared with session.do_evaluate): an
+        # unrepresentative (all-empty) or unanalyzable workload never counts as
+        # target_met and never proposes a change.
+        term, stall_streak = decide_termination(
+            it, scores, agg, frac, target_fraction=target_fraction,
+            max_iterations=max_iterations, prev_aggregate=prev_aggregate,
+            stall_streak=stall_streak, use_actual=use_actual,
+            allow_empty=_allow_empty(), proc_block=proc_block,
+        )
+        if term.reason == "target_met":
             history.append(result)
             run.log(f"[iter {it}] STOP — target met: {frac:.0%} good, agg={agg:.1f}")
             break
-
-        # termination: stalled (require 2 consecutive no-improvement rounds)
-        if agg > prev_aggregate + 0.5:
-            stall_streak = 0
-        else:
-            stall_streak += 1
-        if it > 0 and stall_streak >= 2:
+        if term.stop and not term.eligible_for_apply:
+            # blocked / empty_workload / not_analyzable — a non-plan terminal.
             history.append(result)
-            run.log(f"[iter {it}] STOP — stalled {stall_streak} consecutive round(s) "
-                    f"(agg={agg:.1f} vs prev {prev_aggregate:.1f})")
+            run.log(f"[iter {it}] STOP — {term.reason} [{term.terminal_status}]"
+                    + (f": {term.note}" if term.note else ""))
+            break
+        if term.stop:  # stalled / max_iterations
+            history.append(result)
+            run.log(f"[iter {it}] STOP — {term.reason} (agg={agg:.1f} vs prev {prev_aggregate:.1f})")
             break
 
         # decision step
@@ -221,6 +253,9 @@ def main(argv=None):
     ap.add_argument("--target-fraction", type=float, default=0.8)
     ap.add_argument("--quality-threshold", type=float, default=75.0)
     ap.add_argument("--max-combos", type=int, default=12)
+    ap.add_argument("--command-timeout", type=int, default=capture.DEFAULT_COMMAND_TIMEOUT,
+                    help="per-combo ACTUAL-capture command timeout in seconds "
+                         "(0 disables); a runaway call is cancelled when it trips")
     ap.add_argument("--actual", action="store_true",
                     help="run ACTUAL plans (executes proc — non-prod only)")
     ap.add_argument("--out-dir", default="out",
@@ -262,6 +297,7 @@ def main(argv=None):
             quality_threshold=args.quality_threshold,
             use_actual=args.actual,
             max_combos=args.max_combos,
+            command_timeout=args.command_timeout,
         )
 
         # End-of-run artifacts, all inside the run folder alongside the evidence.
@@ -474,9 +510,16 @@ def _render_iteration(r: IterationResult) -> str:
     rows = []
     for s in r.scores:
         warn = "; ".join(s.warnings) if s.warnings else ""
+        status = getattr(s, "status", "analyzed")
+        if status != "analyzed":
+            # Not a plan-quality measurement — show the truthful status, not a
+            # misleading score of zero.
+            score_cell = f'<span class="score-pill neutral" title="{_esc(s.status_reason)}">{_esc(status)}</span>'
+        else:
+            score_cell = f'<span class="score-pill {_score_class(s.score)}">{s.score:.1f}</span>'
         rows.append(
             f'<tr><td><code>{_esc(s.combo_label)}</code></td>'
-            f'<td class="num"><span class="score-pill {_score_class(s.score)}">{s.score:.1f}</span></td>'
+            f'<td class="num">{score_cell}</td>'
             f'<td class="num">{_esc(_fmt(s.elapsed_ms))}</td>'
             f'<td class="num">{_esc(_fmt(s.cpu_ms))}</td>'
             f'<td class="num">{_esc(_fmt(s.logical_reads))}</td>'
@@ -594,6 +637,7 @@ nav.jump a:hover { background: #dde4ff; }
 .score-pill.good { background: var(--good-bg); color: var(--good); }
 .score-pill.warn { background: var(--warn-bg); color: var(--warn); }
 .score-pill.bad { background: var(--bad-bg); color: var(--bad); }
+.score-pill.neutral { background: #eef1f6; color: var(--muted); font-weight: 600; }
 .timeline { list-style: none; margin: 0; padding: 0; }
 .tl-item { display: grid; grid-template-columns: 22px 1fr; gap: 6px; padding-bottom: 18px; position: relative; }
 .tl-item:not(:last-child)::before { content: ""; position: absolute; left: 9px; top: 18px; bottom: 0; width: 2px; background: var(--border); }
