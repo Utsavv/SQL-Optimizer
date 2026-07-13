@@ -14,7 +14,13 @@ import re
 import xml.etree.ElementTree as ET
 from typing import Optional
 
+from . import eligibility
 from .models import ParamCombo, PlanCapture
+
+# Default per-combo command timeout (seconds) for ACTUAL capture. Bounds the cost
+# of any single call so a runaway generator/administrative proc cannot outlive
+# its caller; the server request is cancelled when it trips. Overridable per call.
+DEFAULT_COMMAND_TIMEOUT = 120
 
 # ShowPlan namespace (actual plans carry RunTimeInformation / QueryTimeStats here)
 _NS = {"sp": "http://schemas.microsoft.com/sqlserver/2004/07/showplan"}
@@ -117,7 +123,10 @@ def _drain_messages(cursor, sink: list[str]) -> None:
             sink.append(cleaned)
 
 
-def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
+def capture_actual(
+    cursor, proc_name: str, combo: ParamCombo,
+    timeout: Optional[int] = DEFAULT_COMMAND_TIMEOUT,
+) -> PlanCapture:
     """Actual plan + runtime stats. EXECUTES the proc — non-prod / confirmed only.
 
     With SET STATISTICS XML ON, each executed statement returns its data result
@@ -126,11 +135,23 @@ def capture_actual(cursor, proc_name: str, combo: ParamCombo) -> PlanCapture:
     the actual row counts are accurate) and then pick out the XML set, which is
     the last result set after the data. SET STATISTICS IO / TIME are also turned
     on so the per-table logical/physical read counts and CPU/elapsed timings are
-    captured as text evidence (collected from the message stream)."""
+    captured as text evidence (collected from the message stream).
+
+    ``timeout`` (seconds, 0 disables) bounds the single call: pyodbc sets it as
+    the ODBC query timeout, so a runaway proc's server request is cancelled
+    rather than allowed to outlive the caller. A timeout surfaces as a capture
+    error classified as ``timeout`` (never a plan score)."""
     args = _arg_list(combo)
     exec_stmt = f"EXEC {proc_name} {args};" if args else f"EXEC {proc_name};"
     io_msgs: list[str] = []
     try:
+        if timeout is not None:
+            # ODBC query timeout: the driver cancels the running statement server-
+            # side when it trips, so child DB work cannot continue past it.
+            try:
+                cursor.timeout = int(timeout)
+            except Exception:
+                pass
         cursor.execute("SET STATISTICS XML ON; SET STATISTICS IO ON; SET STATISTICS TIME ON;")
         cursor.execute(exec_stmt)
         plan_xml = ""
@@ -173,6 +194,36 @@ def capture_workload(
     proc_name: str,
     combos: list[ParamCombo],
     actual: bool = False,
+    timeout: Optional[int] = DEFAULT_COMMAND_TIMEOUT,
 ) -> list[PlanCapture]:
+    """Capture every combo, with two guards for actual mode:
+
+    * combos the discovery step flagged ineligible (invalid input, TVP, secret,
+      curated-input required) are NOT executed — they carry their status straight
+      through to analysis instead of hitting the server.
+    * a deterministic *environment* failure that will affect every remaining
+      combo identically (a missing Full-Text component, SQL error 7609) short-
+      circuits the rest of the workload: there is no point running eleven more
+      calls that fail for the same server-level reason.
+    """
     fn = capture_actual if actual else capture_estimated
-    return [fn(cursor, proc_name, c) for c in combos]
+    caps: list[PlanCapture] = []
+    blocked: Optional[str] = None
+    for c in combos:
+        # Skip combos already known to be non-scorable — never execute them.
+        if getattr(c, "status", eligibility.OK) != eligibility.OK:
+            caps.append(PlanCapture(combo=c, plan_xml=""))
+            continue
+        # Once a shared server prerequisite failed, don't re-run the rest.
+        if blocked is not None:
+            caps.append(PlanCapture(
+                combo=c, plan_xml="",
+                error=f"skipped after a shared prerequisite failure: {blocked}"))
+            continue
+        cap = fn(cursor, proc_name, c, timeout) if actual else fn(cursor, proc_name, c)
+        caps.append(cap)
+        if actual and cap.error:
+            classified = eligibility.classify_sql_error(cap.error)
+            if classified and classified[0] == eligibility.BLOCKED_PREREQUISITE:
+                blocked = cap.error
+    return caps

@@ -18,8 +18,39 @@ heavily on how representative this workload is.
 4. **Query Store** — if enabled, `values_from_query_store` surfaces recently
    executed call texts so a caller/LLM can tune against values that *actually
    occurred* in production. Raw texts are surfaced for parsing today.
-5. **Synthesized** — boundary + typical values per type family. Guarantees a
-   workload even when nothing can be anchored to real data.
+5. **Synthesized** — boundary + typical values per type family, constrained to
+   each parameter's **declared** range (see *Type-aware synthesis* below).
+   Guarantees a workload even when nothing can be anchored to real data.
+
+## Type-aware synthesis + eligibility gating
+
+Discovery no longer emits values that a call would reject and then mis-score as a
+bad plan. `scripts/eligibility.py` (procedure-agnostic, no per-proc constants)
+gates the workload:
+
+- **Type-aware numeric ranges.** `_synth_values` delegates numeric types to
+  `eligibility.numeric_synth_values`, so a `tinyint` gets `0..255`, never the old
+  `1000` / `999999` that raised *"Error converting data type int to tinyint"*.
+  Ranges cover `tinyint`/`smallint`/`int`/`bigint`, `decimal(p,s)` precision/
+  scale, and `bit`.
+- **Per-combo validity.** `mark_combo_eligibility` flags any combo whose value
+  doesn't fit its declared type (`invalid_input`) or whose values form an invalid
+  *call* together — e.g. a role name and user name that collide, or a special/
+  fixed principal (`requires_curated_workload`). Flagged combos are carried
+  through evidence but **never executed or scored as plans**.
+- **Procedure-level preconditions.** `assess_proc_eligibility` blocks the whole
+  actual run — before any execution — when the generator can't build a valid,
+  representative workload: a table-valued or JSON/XML parameter
+  (`requires_curated_workload`), a secret parameter (`requires_sensitive_input`),
+  a paired setup/teardown proc (`requires_setup`), a Full-Text-dependent proc on
+  a server missing the component (`blocked_prerequisite`), or an unbounded bulk
+  generator without the `SP_OPT_ALLOW_BULK` opt-in.
+- **Secrets are never mined.** Sensitive columns are not read for discovery, and
+  sensitive values are redacted from every generated combo before anything is
+  persisted.
+- **Representativeness.** An actual workload in which *every* call returns zero
+  rows cannot terminate as `target_met` (opt in with `SP_OPT_ALLOW_EMPTY=1`),
+  because a plan measured only on empty results is not representative.
 
 ## Exploring the proc's own tables for real values
 

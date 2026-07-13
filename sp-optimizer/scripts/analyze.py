@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 import xml.etree.ElementTree as ET
 
+from . import eligibility
 from .models import PlanCapture, PlanScore
 
 # Physical operators that read an entire input (vs. a seek into a subset).
@@ -27,17 +28,47 @@ def _findall(root, tag: str):
 
 def analyze_plan(cap: PlanCapture) -> PlanScore:
     label = cap.combo.label or "default"
-    if cap.error or not cap.plan_xml:
+
+    # A combo the discovery step already marked ineligible (invalid synthetic
+    # value, TVP, sensitive secret, curated-input required, ...) is not a plan at
+    # all — carry its status through instead of scoring it as a bad query plan.
+    if getattr(cap.combo, "status", eligibility.OK) != eligibility.OK:
         return PlanScore(
-            combo_label=label,
-            score=0.0,
-            warnings=[f"capture failed: {cap.error or 'empty plan'}"],
+            combo_label=label, score=0.0,
+            status=cap.combo.status, status_reason=cap.combo.status_reason,
+            warnings=[f"{cap.combo.status}: {cap.combo.status_reason}"],
+        )
+
+    # A capture ERROR is classified by cause: a missing server feature, an
+    # invalid input, a needed setup, or a timeout is NOT a bad plan — it gets its
+    # own non-scorable status so termination can report the real reason.
+    if cap.error:
+        classified = eligibility.classify_sql_error(cap.error)
+        status, reason = classified if classified else (
+            eligibility.CAPTURE_FAILED, cap.error)
+        return PlanScore(
+            combo_label=label, score=0.0, status=status, status_reason=reason,
+            warnings=[f"{status}: {reason}"],
+        )
+
+    # No error but no ShowPlan XML: capture produced nothing analyzable (e.g. a
+    # control/error-handling proc that never runs a query). This is a capture
+    # failure, not a score of zero.
+    if not cap.plan_xml:
+        return PlanScore(
+            combo_label=label, score=0.0, status=eligibility.CAPTURE_FAILED,
+            status_reason="no ShowPlan XML was captured (no analyzable plan)",
+            warnings=["capture_failed: empty plan"],
         )
 
     try:
         root = ET.fromstring(cap.plan_xml)
     except ET.ParseError as e:
-        return PlanScore(combo_label=label, score=0.0, warnings=[f"xml parse error: {e}"])
+        return PlanScore(
+            combo_label=label, score=0.0, status=eligibility.CAPTURE_FAILED,
+            status_reason=f"xml parse error: {e}",
+            warnings=[f"capture_failed: xml parse error: {e}"],
+        )
 
     score = 100.0
     warnings: list[str] = []

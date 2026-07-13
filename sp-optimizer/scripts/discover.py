@@ -34,6 +34,7 @@ from datetime import datetime, timedelta
 from itertools import combinations, product
 from typing import Optional
 
+from . import eligibility
 from .models import ParamCombo, ProcParam
 
 
@@ -63,8 +64,11 @@ SIGNATURE_SQL = """
 SELECT p.name              AS param_name,
        t.name              AS type_name,
        p.max_length        AS max_length,
+       p.precision         AS precision,
+       p.scale             AS scale,
        p.is_output         AS is_output,
-       p.has_default_value AS has_default
+       p.has_default_value AS has_default,
+       t.is_table_type     AS is_table_type
 FROM sys.parameters p
 JOIN sys.types t ON p.user_type_id = t.user_type_id
 WHERE p.object_id = OBJECT_ID(?)
@@ -82,7 +86,10 @@ def get_signature(cursor, proc_name: str) -> list[ProcParam]:
         type_disp = row.type_name
         if row.type_name in ("varchar", "nvarchar", "char", "nchar"):
             type_disp = f"{row.type_name}({row.max_length})"
+        elif row.type_name in ("decimal", "numeric"):
+            type_disp = f"{row.type_name}({getattr(row, 'precision', 18)},{getattr(row, 'scale', 0)})"
         has_default = bool(getattr(row, "has_default", False))
+        is_table = bool(getattr(row, "is_table_type", False))
         params.append(
             ProcParam(
                 name=row.param_name,
@@ -90,6 +97,8 @@ def get_signature(cursor, proc_name: str) -> list[ProcParam]:
                 is_output=bool(row.is_output),
                 has_default=has_default,
                 default=None,
+                is_table_type=is_table,
+                is_sensitive=eligibility.is_sensitive_param(row.param_name),
             )
         )
     return params
@@ -444,7 +453,9 @@ def derive_combos_from_data(
         if _is_datetime(p):
             continue
         common = rare = None
-        if p.name in mapped:
+        # Never read credential material from the database for discovery: a
+        # secret-bearing param is left to synthesis (and later redacted).
+        if p.name in mapped and not p.is_sensitive:
             table, col, _op = mapped[p.name]
             common, rare = _sample_column_values(cursor, table, col)
         if common is None:
@@ -544,18 +555,23 @@ def derive_combos_from_data(
 # ---- 3. synthesize values per type -----------------------------------------
 
 def _synth_values(param: ProcParam) -> list[object]:
-    """Boundary + typical candidate values for a parameter, by type family."""
+    """Boundary + typical candidate values for a parameter, by type family.
+
+    Numeric values are constrained to the parameter's DECLARED type range so a
+    synthetic value can never overflow / fail conversion (e.g. ``tinyint`` gets
+    0..255, never 1000). See ``eligibility.numeric_synth_values``.
+    """
     t = param.sql_type.lower()
-    if any(t.startswith(x) for x in ("int", "bigint", "smallint", "tinyint")):
-        return [0, 1, 1000, 999999]            # low / typical / high cardinality
-    if t.startswith(("decimal", "numeric", "money", "float", "real")):
+    # Type-aware numeric ranges first (tinyint/smallint/int/bigint/decimal/bit).
+    numeric = eligibility.numeric_synth_values(param.sql_type)
+    if numeric is not None:
+        return numeric
+    if t.startswith(("money", "smallmoney", "float", "real")):
         return [0, 1.5, 1000.0]
     if t.startswith(("date", "datetime", "smalldatetime", "datetime2")):
         return ["2020-01-01", "2024-06-01"]    # old vs recent (sniffing-sensitive)
     if t.startswith(("varchar", "nvarchar", "char", "nchar")):
         return ["A", "common_value", "rare_value"]
-    if t.startswith("bit"):
-        return [0, 1]
     if t.startswith("uniqueidentifier"):
         return ["00000000-0000-0000-0000-000000000000"]
     return [None]
@@ -584,6 +600,148 @@ def synthesize_combos(
     return combos
 
 
+# ---- eligibility gating -----------------------------------------------------
+#
+# Before any actual capture, decide whether the workload the generator can build
+# is even *valid* and *representative*. Some conditions block the whole run (a
+# missing server feature, a required predecessor, a TVP/secret we cannot safely
+# synthesize); others invalidate individual combos (a value that doesn't fit its
+# type, a cross-parameter clash). All of them keep the loop from treating a
+# non-plan failure as a bad query plan.
+
+
+def _has_curated_workload() -> bool:
+    """True when the caller supplied an explicit workload / fixture, which is the
+    sanctioned way to exercise procs the generator cannot safely synthesize
+    (TVPs, secrets, structured payloads)."""
+    path = os.environ.get("SP_OPT_COMBOS")
+    return bool(path and os.path.exists(path))
+
+
+def _has_setup_contract() -> bool:
+    """True when the caller declared a setup/teardown contract for capture."""
+    return bool(os.environ.get("SP_OPT_SETUP_SQL") or os.environ.get("SP_OPT_TEARDOWN_SQL"))
+
+
+def _allow_bulk() -> bool:
+    return os.environ.get("SP_OPT_ALLOW_BULK", "").strip().lower() in ("1", "true", "yes")
+
+
+def server_missing_fulltext(cursor) -> bool:
+    """True when the server does NOT have the Full-Text Search component. Used to
+    turn a Full-Text-dependent proc into a clear precondition failure instead of
+    N identical error-7609 captures. Degrades to False (unknown) on any error."""
+    try:
+        cursor.execute("SELECT CAST(SERVERPROPERTY('IsFullTextInstalled') AS int);")
+        row = cursor.fetchone()
+        return row is not None and row[0] == 0
+    except Exception:
+        return False
+
+
+def assess_proc_eligibility(
+    cursor, proc_name: str, params: list[ProcParam], proc_text: str,
+) -> Optional[tuple[str, str]]:
+    """Return a ``(status, reason)`` precondition that blocks the whole actual-
+    plan run, or None when the proc can be exercised. Generic — every check keys
+    off metadata / proc text, never a specific proc name. A caller-supplied
+    curated workload / setup contract opts out of the corresponding block.
+    """
+    inputs = [p for p in params if not p.is_output]
+    curated = _has_curated_workload()
+
+    # Table-valued parameters cannot be scalar literals.
+    tvps = [p.name for p in inputs if p.is_table_type]
+    if tvps and not curated:
+        return (eligibility.REQUIRES_CURATED_WORKLOAD,
+                f"table-valued parameter(s) {tvps} cannot be synthesized as scalar "
+                f"literals; supply a curated TVP fixture via SP_OPT_COMBOS")
+
+    # Secret-bearing parameters must be caller-supplied, never mined.
+    secrets = [p.name for p in inputs if p.is_sensitive]
+    if secrets and not curated:
+        return (eligibility.REQUIRES_SENSITIVE_INPUT,
+                f"parameter(s) {secrets} carry secret material (password/token/key); "
+                f"a valid call needs a caller-supplied secret (SP_OPT_COMBOS, kept "
+                f"local and out of artifacts). Credentials are never mined from data.")
+
+    # Structured JSON / XML scalar payloads we cannot safely infer.
+    for p in inputs:
+        if eligibility.param_expects_json(proc_text, p.name) and not curated:
+            return (eligibility.REQUIRES_CURATED_WORKLOAD,
+                    f"{p.name} is validated/parsed as JSON (ISJSON/OPENJSON); supply "
+                    f"a valid JSON fixture via SP_OPT_COMBOS")
+        if eligibility.param_expects_xml(proc_text, p.name, p.sql_type) and not curated:
+            return (eligibility.REQUIRES_CURATED_WORKLOAD,
+                    f"{p.name} is an XML payload; supply a valid XML fixture via SP_OPT_COMBOS")
+
+    # Full-Text Search prerequisite: only a block when the server lacks the
+    # component AND the proc actually uses a Full-Text predicate.
+    if eligibility.requires_full_text(proc_text) and server_missing_fulltext(cursor):
+        return (eligibility.BLOCKED_PREREQUISITE,
+                "the procedure uses Full-Text Search predicates (CONTAINS/FREETEXT) "
+                "but Full-Text Search is not installed on this server (SQL error 7609)")
+
+    # Paired setup/teardown lifecycle — needs a predecessor unless a contract is
+    # supplied.
+    partner = eligibility.setup_partner(proc_name)
+    if partner and not _has_setup_contract():
+        return (eligibility.REQUIRES_SETUP,
+                f"appears to require predecessor state established by {partner}; "
+                f"declare a setup/teardown contract (SP_OPT_SETUP_SQL / "
+                f"SP_OPT_TEARDOWN_SQL) before actual capture")
+
+    # Unbounded bulk generator / storage rebuild — must be opted into explicitly.
+    bulk = eligibility.is_bulk_generator(proc_text, proc_name)
+    if bulk and not _allow_bulk():
+        return (eligibility.REQUIRES_CURATED_WORKLOAD,
+                f"{bulk}; running it blind could execute for a long time with large "
+                f"side effects. Set SP_OPT_ALLOW_BULK=1 to run it with the "
+                f"per-combo command timeout, or supply a bounded curated workload.")
+
+    return None
+
+
+def mark_combo_eligibility(combos: list[ParamCombo], params: list[ProcParam]) -> None:
+    """Flag each combo whose values are individually or jointly invalid, so the
+    capture step can skip it and analysis records a discovery defect (not a bad
+    plan). Mutates combos in place."""
+    by_name = {p.name: p for p in params}
+    for combo in combos:
+        if combo.status != eligibility.OK:
+            continue
+        # Per-parameter type validity (range/precision/length/type family).
+        bad = None
+        for name, val in combo.values.items():
+            p = by_name.get(name)
+            if p is not None and not eligibility.value_fits_type(val, p.sql_type):
+                bad = f"{name}={val!r} is not valid for declared type {p.sql_type}"
+                break
+        if bad:
+            combo.status = eligibility.INVALID_INPUT
+            combo.status_reason = bad
+            continue
+        # Cross-parameter / special-principal validity (independently-real values
+        # that form an invalid call together).
+        reason = eligibility.validate_principal_combo(combo.values)
+        if reason:
+            combo.status = eligibility.REQUIRES_CURATED_WORKLOAD
+            combo.status_reason = reason
+
+
+def _redact_sensitive_combos(combos: list[ParamCombo], params: list[ProcParam]) -> None:
+    """Replace any sensitive-parameter value in the generated combos with a fixed
+    redaction token, so no credential-shaped literal is ever persisted to a label,
+    session file, or report. Mutates combos in place."""
+    sensitive = {p.name for p in params if p.is_sensitive}
+    if not sensitive:
+        return
+    for combo in combos:
+        for name in list(combo.values):
+            if name in sensitive and combo.values[name] is not None:
+                combo.values[name] = eligibility.redact(combo.values[name])
+
+
 # ---- public entry point -----------------------------------------------------
 
 def discover(
@@ -591,8 +749,12 @@ def discover(
     proc_name: str,
     max_combos: int = 12,
     use_query_store: bool = True,
-) -> tuple[list[ProcParam], list[ParamCombo]]:
-    """Return (signature, candidate parameter combos) for ANY procedure.
+) -> tuple[list[ProcParam], list[ParamCombo], Optional[tuple[str, str]]]:
+    """Return (signature, candidate combos, proc_block) for ANY procedure.
+
+    ``proc_block`` is a ``(status, reason)`` precondition that blocks the whole
+    actual-plan run (missing feature, required setup, TVP/secret/structured input
+    that cannot be safely synthesized), or None when the proc is runnable.
 
     Workload sources are tried in priority order; the first that yields combos
     wins, and every source degrades safely to the next:
@@ -601,14 +763,24 @@ def discover(
       3. synthesized         — type-based boundary values (always succeeds).
     """
     params = get_signature(cursor, proc_name)
+    proc_text = get_proc_text(cursor, proc_name)
 
     combos = _combos_from_env()
     if combos is None:
-        proc_text = get_proc_text(cursor, proc_name)
         try:
             combos = derive_combos_from_data(cursor, params, proc_text, max_combos=max_combos)
         except Exception:
             combos = None
     if combos is None:
         combos = synthesize_combos(params, max_combos=max_combos)
-    return params, combos
+
+    # Never persist secret-shaped literals; classify individually/jointly invalid
+    # combos as discovery defects rather than plan scores.
+    _redact_sensitive_combos(combos, params)
+    mark_combo_eligibility(combos, params)
+
+    try:
+        proc_block = assess_proc_eligibility(cursor, proc_name, params, proc_text)
+    except Exception:
+        proc_block = None
+    return params, combos, proc_block
