@@ -1,6 +1,8 @@
 """Discovery tests: type-aware synthesis (Issue 5), combo eligibility marking
-(Issues 5/6), sensitive redaction (Issue 10), and the procedure-level
-precondition gate (Issues 4/7/9/10/11/12)."""
+(Issues 5/6), sensitive redaction (Issue 10), the procedure-level precondition
+gate (Issues 4/7/9/10/11/12), and CASE-expression datetime range-pair mapping."""
+from datetime import datetime
+
 import pytest
 
 from scripts import discover, eligibility
@@ -156,3 +158,94 @@ def test_ordinary_proc_not_blocked():
     block = discover.assess_proc_eligibility(MockCursor(), "dbo.GetThing", params,
                                              "SELECT * FROM t WHERE id = @id")
     assert block is None
+
+
+# ---- CASE-expression datetime range-pair mapping ---------------------------
+#
+# WWI's Integration.GetOrderUpdates / GetSaleUpdates bound both cutoff params
+# against a max-of-two-datetimes expression:
+#     CASE WHEN ol.LastEditedWhen > o.LastEditedWhen
+#          THEN ol.LastEditedWhen ELSE o.LastEditedWhen END > @LastCutoff
+#      AND CASE WHEN ... END <= @NewCutoff
+# The simple matcher used to capture the CASE keyword END as the "column",
+# fail to resolve it, and fall through to a Cartesian synthesis that produced
+# an inverted (lower > upper) window and all-future/empty ranges.
+
+_CASE_PROC = """
+CREATE PROCEDURE Integration.GetOrderUpdates
+    @LastCutoff datetime2(7), @NewCutoff datetime2(7)
+AS
+BEGIN
+    SELECT o.OrderID, ol.OrderLineID
+    FROM Sales.Orders AS o
+    INNER JOIN Sales.OrderLines AS ol ON o.OrderID = ol.OrderID
+    WHERE CASE WHEN ol.LastEditedWhen > o.LastEditedWhen THEN ol.LastEditedWhen ELSE o.LastEditedWhen END > @LastCutoff
+      AND CASE WHEN ol.LastEditedWhen > o.LastEditedWhen THEN ol.LastEditedWhen ELSE o.LastEditedWhen END <= @NewCutoff;
+END
+"""
+
+_SIMPLE_PROC = """
+CREATE PROCEDURE Integration.GetMovementUpdates
+    @LastCutoff datetime2(7), @NewCutoff datetime2(7)
+AS
+BEGIN
+    SELECT sit.StockItemTransactionID
+    FROM Warehouse.StockItemTransactions AS sit
+    WHERE sit.LastEditedWhen > @LastCutoff AND sit.LastEditedWhen <= @NewCutoff;
+END
+"""
+
+_RANGE_PARAMS = [ProcParam(name="@LastCutoff", sql_type="datetime2"),
+                 ProcParam(name="@NewCutoff", sql_type="datetime2")]
+
+
+def _bounds(combos):
+    return [(datetime.strptime(c.values["@LastCutoff"], "%Y-%m-%d %H:%M:%S"),
+             datetime.strptime(c.values["@NewCutoff"], "%Y-%m-%d %H:%M:%S"))
+            for c in combos]
+
+
+def test_case_expr_maps_both_bounds_to_real_column():
+    aliases = discover._resolve_aliases(_CASE_PROC)
+    lo = discover._column_for_param(_CASE_PROC, "@LastCutoff", aliases)
+    hi = discover._column_for_param(_CASE_PROC, "@NewCutoff", aliases)
+    assert lo == ("Sales.OrderLines", "LastEditedWhen", ">")
+    assert hi == ("Sales.OrderLines", "LastEditedWhen", "<=")
+
+
+def test_simple_matcher_rejects_case_end_keyword():
+    # The literal CASE keyword END must never be mistaken for a column.
+    aliases = discover._resolve_aliases(_CASE_PROC)
+    assert discover._simple_column_for_param(_CASE_PROC, "@LastCutoff", aliases) is None
+
+
+@pytest.mark.parametrize("proc", [_CASE_PROC, _SIMPLE_PROC])
+def test_range_pair_windows_are_ordered_and_anchored(proc):
+    # min/max come back as real data; every window must be ordered and no later
+    # than the real max (i.e. not an all-future synthetic spread).
+    data_hi = datetime(2016, 5, 31, 12, 0, 0)
+    cur = MockCursor([("MIN(", [Row(lo=datetime(2013, 1, 1), hi=data_hi)])])
+    combos = discover.derive_combos_from_data(cur, _RANGE_PARAMS, proc, max_combos=12)
+    assert combos
+    bounds = _bounds(combos)
+    assert all(lo <= hi for lo, hi in bounds), "inverted window produced"
+    assert any(hi <= data_hi for _, hi in bounds), "no window anchored within real data"
+
+
+def test_synth_fallback_range_pair_is_ordered_never_inverted():
+    # No proc text mapping possible from the DB, but the fallback still orders
+    # the pair from the operators instead of emitting a Cartesian product.
+    combos = discover.synthesize_combos(_RANGE_PARAMS, max_combos=12, proc_text=_CASE_PROC)
+    bounds = _bounds(combos)
+    assert bounds and all(lo <= hi for lo, hi in bounds)
+    # narrow/medium/wide/empty shape, not the old 2x2 Cartesian product
+    assert len(combos) == 4
+
+
+def test_range_pair_synth_when_minmax_unreadable():
+    # Mapping succeeds but the column min/max can't be read -> ordered synthetic
+    # windows, still never inverted (regression guard for the old `return []`).
+    cur = MockCursor()  # no MIN rule -> _column_min_max returns None
+    combos = discover.derive_combos_from_data(cur, _RANGE_PARAMS, _CASE_PROC, max_combos=12)
+    bounds = _bounds(combos)
+    assert bounds and all(lo <= hi for lo, hi in bounds)

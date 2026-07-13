@@ -185,32 +185,16 @@ def _resolve_aliases(proc_text: str) -> dict[str, str]:
     return aliases
 
 
-def _column_for_param(proc_text: str, param_name: str, aliases: dict[str, str]) -> Optional[tuple[str, str, str]]:
-    """Best-effort: find the (table, column, operator) a parameter is compared to.
+# Keywords that can be captured by the generic ``\w+`` column pattern but are not
+# real columns — most importantly the ``END`` that closes a ``CASE`` expression,
+# which otherwise gets mis-mapped as the "column" a param is compared to.
+_NOT_A_COLUMN = {"end", "then", "else", "when", "case", "and", "or", "not", "null"}
 
-    Handles both orderings:  ``col <op> @param``  and  ``@param <op> col``.
-    Returns the table fully resolved through the alias map, or None if the
-    parameter isn't a simple column comparison (e.g. wrapped in a function).
-    """
-    esc = re.escape(param_name)
-    col_ref = r"(?:(?P<alias>\w+)\s*\.\s*)?(?P<col>\w+)"
-    # col <op> @param
-    m = re.search(col_ref + r"\s*(?P<op>>=|<=|<>|>|<|=)\s*" + esc + r"\b",
-                  proc_text, re.IGNORECASE)
-    if not m:
-        # @param <op> col  -> normalise the operator direction
-        m = re.search(esc + r"\s*(?P<op>>=|<=|<>|>|<|=)\s*" + col_ref,
-                      proc_text, re.IGNORECASE)
-        if m:
-            flip = {">": "<", "<": ">", ">=": "<=", "<=": ">="}
-            op = flip.get(m.group("op"), m.group("op"))
-            m_op = op
-        else:
-            return None
-    else:
-        m_op = m.group("op")
-    alias = (m.group("alias") or "").lower()
-    col = m.group("col")
+_FLIP_OP = {">": "<", "<": ">", ">=": "<=", "<=": ">="}
+
+
+def _resolve_column(alias: str, col: str, aliases: dict[str, str]) -> Optional[str]:
+    """Resolve an (alias, column) reference to its source table, or None."""
     table = aliases.get(alias) if alias else None
     if table is None:
         # unqualified column: only safe if there is exactly one table in scope
@@ -219,7 +203,84 @@ def _column_for_param(proc_text: str, param_name: str, aliases: dict[str, str]) 
             table = next(iter(distinct))
         else:
             return None
+    return table
+
+
+def _simple_column_for_param(proc_text: str, param_name: str, aliases: dict[str, str]) -> Optional[tuple[str, str, str]]:
+    """Direct ``col <op> @param`` / ``@param <op> col`` comparison, if present."""
+    esc = re.escape(param_name)
+    col_ref = r"(?:(?P<alias>\w+)\s*\.\s*)?(?P<col>\w+)"
+    # col <op> @param
+    m = re.search(col_ref + r"\s*(?P<op>>=|<=|<>|>|<|=)\s*" + esc + r"\b",
+                  proc_text, re.IGNORECASE)
+    if m:
+        m_op = m.group("op")
+    else:
+        # @param <op> col  -> normalise the operator direction
+        m = re.search(esc + r"\s*(?P<op>>=|<=|<>|>|<|=)\s*" + col_ref,
+                      proc_text, re.IGNORECASE)
+        if not m:
+            return None
+        m_op = _FLIP_OP.get(m.group("op"), m.group("op"))
+    col = m.group("col")
+    # A match on a CASE keyword (e.g. ``END > @param``) is not a real column;
+    # let the expression-aware matcher handle it.
+    if col.lower() in _NOT_A_COLUMN:
+        return None
+    table = _resolve_column((m.group("alias") or "").lower(), col, aliases)
+    if table is None:
+        return None
     return table, col, m_op
+
+
+def _expr_column_for_param(proc_text: str, param_name: str, aliases: dict[str, str]) -> Optional[tuple[str, str, str]]:
+    """Map a param compared against a ``CASE WHEN a > b THEN a ELSE b END`` expr.
+
+    This "most recent edit across two joined tables" idiom (used by WWI's
+    ``Integration.GetOrderUpdates`` / ``GetSaleUpdates``) hides the effective
+    timestamp behind a max-of-two-columns expression, so the simple matcher
+    can't anchor it. Both range bounds compare against the *same* expression, so
+    anchoring both to the first real column inside it lets the normal range-pair
+    window sweep read a real date domain instead of falling back to synthetic
+    constants. Returns None when there is no such expression comparison.
+    """
+    esc = re.escape(param_name)
+    # A single (non-nested) CASE ... END block. Disallowing an inner CASE keeps
+    # each bound anchored to its own expression rather than spanning both.
+    expr = r"CASE\b(?:(?!\bCASE\b).)*?\bEND\b"
+    flags = re.IGNORECASE | re.DOTALL
+    m = re.search(r"(?P<expr>" + expr + r")\s*(?P<op>>=|<=|<>|>|<|=)\s*" + esc + r"\b",
+                  proc_text, flags)
+    if m:
+        m_op = m.group("op")
+    else:
+        m = re.search(esc + r"\s*(?P<op>>=|<=|<>|>|<|=)\s*(?P<expr>" + expr + r")",
+                      proc_text, flags)
+        if not m:
+            return None
+        m_op = _FLIP_OP.get(m.group("op"), m.group("op"))
+    body = m.group("expr")
+    # First column reference inside the expression that resolves to a real table.
+    # (_resolve_column only accepts a bare column when a single table is in scope.)
+    for cm in re.finditer(r"(?:(?P<alias>\w+)\s*\.\s*)?(?P<col>\w+)", body):
+        col = cm.group("col")
+        if col.lower() in _NOT_A_COLUMN:
+            continue
+        table = _resolve_column((cm.group("alias") or "").lower(), col, aliases)
+        if table is not None:
+            return table, col, m_op
+    return None
+
+
+def _column_for_param(proc_text: str, param_name: str, aliases: dict[str, str]) -> Optional[tuple[str, str, str]]:
+    """Best-effort: find the (table, column, operator) a parameter is compared to.
+
+    Tries a direct column comparison first, then a max-of-two-datetimes
+    ``CASE ... END`` expression. Returns the table fully resolved through the
+    alias map, or None if the parameter isn't anchorable to a real column.
+    """
+    return (_simple_column_for_param(proc_text, param_name, aliases)
+            or _expr_column_for_param(proc_text, param_name, aliases))
 
 
 def _column_min_max(cursor, table: str, column: str) -> Optional[tuple]:
@@ -337,6 +398,46 @@ def _datetime_range_windows(lo, hi) -> list[tuple[object, object, str, float]]:
     return windows
 
 
+# Synthetic anchors used only when a real date range can't be read from the DB.
+# Chosen to match the "recent" / "old" constants _synth_values already emits, so
+# the fallback stays consistent with the type-based synthesizer.
+_SYNTH_DT_HI = datetime(2024, 6, 1)
+_SYNTH_DT_LO = datetime(2020, 1, 1)
+
+
+def _synth_range_windows() -> list[tuple[object, object, str, float]]:
+    """Ordered narrow/medium/wide/empty windows for a datetime range pair when no
+    real data range is available.
+
+    Every window has ``lower <= upper`` (never the inverted pair the old
+    Cartesian fallback produced) and is shaped like a realistic ETL pull, so a
+    range-pair proc still gets a sane sniffing spread offline.
+    """
+    hi, lo = _SYNTH_DT_HI, _SYNTH_DT_LO
+    return [
+        (hi - timedelta(days=1), hi, "narrow: last 1 day", 3.0),
+        (hi - timedelta(days=30), hi, "medium: last 30 days", 2.0),
+        (lo, hi, "wide: full history", 1.0),
+        (hi, hi + timedelta(hours=1), "edge: empty window", 1.0),
+    ]
+
+
+def _detect_range_pair(
+    dmapped: dict[str, tuple[str, str, str]],
+) -> Optional[tuple[str, str, str, str]]:
+    """Find a coupled lower/upper datetime range pair sharing the same table+column.
+
+    Returns (lower_param, upper_param, table, col) or None.
+    """
+    lowers = {n: i for n, i in dmapped.items() if i[2] in (">", ">=")}
+    uppers = {n: i for n, i in dmapped.items() if i[2] in ("<", "<=")}
+    for ln, li in lowers.items():
+        for un, ui in uppers.items():
+            if ln != un and (li[0], li[1]) == (ui[0], ui[1]):
+                return (ln, un, li[0], li[1])  # lower, upper, table, col
+    return None
+
+
 def _datetime_windows_for(
     cursor,
     inputs: list[ProcParam],
@@ -355,26 +456,19 @@ def _datetime_windows_for(
         return []
     dmapped = {p.name: mapped[p.name] for p in dt_inputs}
 
-    # Detect a lower/upper range pair sharing the same table+column.
-    lowers = {n: i for n, i in dmapped.items() if i[2] in (">", ">=")}
-    uppers = {n: i for n, i in dmapped.items() if i[2] in ("<", "<=")}
-    range_pair = None
-    for ln, li in lowers.items():
-        for un, ui in uppers.items():
-            if ln != un and (li[0], li[1]) == (ui[0], ui[1]):
-                range_pair = (ln, un, li[0], li[1])  # lower, upper, table, col
-                break
-        if range_pair:
-            break
+    range_pair = _detect_range_pair(dmapped)
 
     out: list[tuple[dict[str, object], str, float]] = []
     if range_pair:
         lparam, uparam, table, col = range_pair
         rng = _column_min_max(cursor, table, col)
-        if not rng:
-            return []
-        lo, hi = rng
-        for lower, upper, label, weight in _datetime_range_windows(lo, hi):
+        # Real range when the column is readable, else ordered synthetic windows
+        # (never [] -> never inverted/future-only Cartesian synthesis downstream).
+        if rng:
+            windows = _datetime_range_windows(rng[0], rng[1])
+        else:
+            windows = _synth_range_windows()
+        for lower, upper, label, weight in windows:
             out.append(({lparam: _fmt_dt(lower), uparam: _fmt_dt(upper)}, label, weight))
     else:
         # Single datetime bound (e.g. col >= @FromDate): vary that one param.
@@ -577,17 +671,100 @@ def _synth_values(param: ProcParam) -> list[object]:
     return [None]
 
 
+def _infer_range_pair_from_ops(
+    dt_inputs: list[ProcParam], proc_text: str
+) -> Optional[tuple[str, str]]:
+    """Order two datetime params into (lower, upper) purely from their operators.
+
+    Used when column mapping failed but the proc still compares exactly two
+    datetime params, so the synthetic fallback can still emit an *ordered* range
+    pair instead of an inverted Cartesian product.
+    """
+    if len(dt_inputs) != 2 or not proc_text:
+        return None
+    ops: dict[str, str] = {}
+    for p in dt_inputs:
+        esc = re.escape(p.name)
+        m = re.search(r"(>=|<=|<>|>|<|=)\s*" + esc + r"\b", proc_text, re.IGNORECASE)
+        if m:
+            ops[p.name] = m.group(1)
+            continue
+        m = re.search(esc + r"\s*(>=|<=|<>|>|<|=)", proc_text, re.IGNORECASE)
+        if m:
+            ops[p.name] = _FLIP_OP.get(m.group(1), m.group(1))
+    lowers = [n for n, o in ops.items() if o in (">", ">=")]
+    uppers = [n for n, o in ops.items() if o in ("<", "<=")]
+    if len(lowers) == 1 and len(uppers) == 1:
+        return lowers[0], uppers[0]
+    return None
+
+
+def _synth_range_pair_combos(
+    params: list[ProcParam], proc_text: str, max_combos: int
+) -> Optional[list[ParamCombo]]:
+    """Ordered synthetic windows for a two-datetime lower/upper range pair.
+
+    Returns None when the proc isn't a recognisable datetime range pair, so the
+    caller falls back to the generic Cartesian synthesis.
+    """
+    inputs = [p for p in params if not p.is_output]
+    dt_inputs = [p for p in inputs if _is_datetime(p)]
+    if len(dt_inputs) < 2:
+        return None
+
+    pair: Optional[tuple[str, str]] = None
+    if proc_text:
+        aliases = _resolve_aliases(proc_text)
+        mapped = {}
+        for p in dt_inputs:
+            info = _column_for_param(proc_text, p.name, aliases)
+            if info:
+                mapped[p.name] = info
+        detected = _detect_range_pair(mapped) if mapped else None
+        if detected:
+            pair = (detected[0], detected[1])
+    if pair is None:
+        pair = _infer_range_pair_from_ops(dt_inputs, proc_text)
+    if pair is None:
+        return None
+
+    lparam, uparam = pair
+    # Non-datetime params still need a concrete value so the EXEC call is complete.
+    base = {}
+    for p in inputs:
+        if _is_datetime(p):
+            continue
+        syn = _synth_values(p)
+        base[p.name] = syn[0] if syn else None
+
+    combos: list[ParamCombo] = []
+    for lower, upper, label, weight in _synth_range_windows():
+        vals = dict(base)
+        vals[lparam] = _fmt_dt(lower)
+        vals[uparam] = _fmt_dt(upper)
+        combos.append(ParamCombo(values=vals, label=label, weight=weight))
+    return combos[:max_combos] or None
+
+
 def synthesize_combos(
     params: list[ProcParam],
     max_combos: int = 12,
+    proc_text: str = "",
 ) -> list[ParamCombo]:
     """Cartesian product of candidate values, capped at max_combos.
 
-    Output params are excluded from the input value space.
+    Output params are excluded from the input value space. A two-datetime
+    lower/upper range pair is special-cased to ordered narrow/medium/wide/empty
+    windows (see _synth_range_pair_combos) instead of a Cartesian product of
+    date constants, which would otherwise emit an inverted ``lower > upper`` pair.
     """
     inputs = [p for p in params if not p.is_output]
     if not inputs:
         return [ParamCombo(values={}, label="no-params")]
+
+    range_combos = _synth_range_pair_combos(params, proc_text, max_combos)
+    if range_combos:
+        return range_combos
 
     value_lists = [_synth_values(p) for p in inputs]
     combos: list[ParamCombo] = []
@@ -772,7 +949,7 @@ def discover(
         except Exception:
             combos = None
     if combos is None:
-        combos = synthesize_combos(params, max_combos=max_combos)
+        combos = synthesize_combos(params, max_combos=max_combos, proc_text=proc_text)
 
     # Never persist secret-shaped literals; classify individually/jointly invalid
     # combos as discovery defects rather than plan scores.
