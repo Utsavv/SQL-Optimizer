@@ -66,6 +66,25 @@ of arguments performs badly for others.
    Both scripts print a ready-to-use pyodbc connection string and an example
    optimizer invocation when they finish.
 
+   > **Restoring from a `.bak` backup instead?** A SQL Server backup restores
+   > only onto an engine of the **same or newer** major version. Check the
+   > backup's source version before `RESTORE DATABASE` (e.g. `RESTORE HEADERONLY
+   > FROM DISK = '...'` → `SoftwareVersionMajor` / `DatabaseVersion`) so a
+   > mismatch fails fast instead of deep inside the restore. Known requirements
+   > for the sample backups:
+   >
+   > | Backup | Minimum SQL Server | Internal DB version |
+   > | --- | --- | --- |
+   > | `WideWorldImporters-Full.bak` | SQL Server 2016 (13.x) | 852 |
+   > | `AdventureWorks2025.bak` | **SQL Server 2025 (17.x)** | 998 |
+   >
+   > `AdventureWorks2025.bak` will **not** restore on SQL Server 2022 (16.x,
+   > database version 957) or earlier — the restore fails with *"The database was
+   > backed up on a server running database version 998. That version is
+   > incompatible with this server, which supports version 957."* Restore it on
+   > SQL Server 2025+, or point the optimizer at a database created by a backup
+   > your target engine supports.
+
 4. **Verify connectivity**
    ```bash
    python setup/test_connection.py
